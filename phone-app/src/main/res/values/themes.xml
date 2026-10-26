@@ -1,0 +1,47 @@
+<resources>
+    <style name="Theme.RokidLabPhone" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:fontFamily">@font/jetbrains_mono</item>
+        <item name="fontFamily">@font/jetbrains_mono</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">@color/brew_bg</item>
+        <item name="android:navigationBarColor">@color/brew_bg</item>
+        <item name="android:colorAccent">@color/brew_coral</item>
+        <item name="android:windowBackground">@color/brew_bg</item>
+        <item name="android:textColorHighlight">#33D40000</item>
+        <item name="android:colorPrimary">@color/brew_coral</item>
+        <item name="android:colorPrimaryDark">@color/brew_coral_dim</item>
+    </style>
+
+    <style name="Theme.RokidLabPhone.Fullscreen" parent="Theme.RokidLabPhone">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <!-- 授权页：透明背景，只托一个"为什么需要权限"的说明弹窗 + 系统授权框。
+         透明是为了让用户看清"自己刚才是从哪个界面被拉过来的"，不至于觉得 App 莫名弹窗。 -->
+    <style name="Theme.RokidLabPhone.Transparent" parent="Theme.RokidLabPhone">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation.Dialog</item>
+    </style>
+
+    <!-- 底部弹层（ask_user 选择卡）：不可浮动的透明全屏窗口 + 内容自己贴底（Compose ModalBottomSheet），
+         宽度/位置完全由 Compose 内容决定，不受系统 Dialog 的默认最大宽度约束。
+         遮罩由 Compose 的 sheet scrim 负责 ⇒ 关掉窗口级 dim，避免"双重变暗"。 -->
+    <style name="Theme.RokidLabPhone.BottomSheet" parent="Theme.RokidLabPhone">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowCloseOnTouchOutside">false</item>
+        <item name="android:windowSoftInputMode">adjustResize</item>
+    </style>
+</resources>

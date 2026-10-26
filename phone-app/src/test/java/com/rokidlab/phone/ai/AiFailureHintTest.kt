@@ -1,0 +1,188 @@
+package com.rokidlab.phone.ai
+
+import com.rokidlab.phone.util.HttpStatusException
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * AI 链路失败的「说人话」映射回归测试（[OpenAiService.aiFailureHint]）。
+ *
+ * 背景（2026-09-15 真机事故）：流式请求遇非 2xx 时错误被静默吞成空轮，用户看到的是
+ * 「抱歉，我暂时无法处理这个问题」—— 分不清是密钥失效、余额不足、模型名写错还是网络抖动，
+ * 日志里也没有任何线索。修复分两层：① [com.rokidlab.phone.util.HttpClient.postSse]
+ * 对非 2xx 显式抛 [HttpStatusException]；② 本函数把异常翻成可行动的提示。
+ *
+ * 本测试锁住第 ② 层的映射，防止以后有人把 4xx 又合并回「服务不可用」这类无信息量文案。
+ */
+class AiFailureHintTest {
+
+    @Test
+    fun `密钥问题提示去检查密钥`() {
+        listOf(401, 403).forEach { code ->
+            val hint = OpenAiService.aiFailureHint(HttpStatusException(code, "{\"error\":\"invalid key\"}"))
+            assertTrue("HTTP $code 应提示检查密钥，实际：$hint", hint.contains("密钥"))
+        }
+    }
+
+    @Test
+    fun `余额不足提示充值`() {
+        val hint = OpenAiService.aiFailureHint(
+            HttpStatusException(402, "{\"error\":{\"message\":\"Insufficient Balance\"}}"),
+        )
+        assertTrue("HTTP 402 应提示充值，实际：$hint", hint.contains("余额"))
+    }
+
+    @Test
+    fun `地址错误与请求被拒给出可行动方向`() {
+        assertTrue(OpenAiService.aiFailureHint(HttpStatusException(404, "")).contains("地址"))
+        // 400 且正文为空（无任何线索）：只能指向日志，不能瞎猜成配置问题
+        val blank = OpenAiService.aiFailureHint(HttpStatusException(400, ""))
+        assertTrue("400 无正文时应指向日志，实际：$blank", blank.contains("日志"))
+    }
+
+    @Test
+    fun `正文能定位原因时优先信正文`() {
+        // 模型名不存在（DeepSeek 原文 "Model Not Exist"）
+        val model = OpenAiService.aiFailureHint(
+            HttpStatusException(400, "{\"error\":{\"message\":\"Model Not Exist\"}}"),
+        )
+        assertTrue("应提示模型名，实际：$model", model.contains("模型名"))
+
+        // 上下文超长
+        val tooLong = OpenAiService.aiFailureHint(
+            HttpStatusException(400, "{\"error\":{\"message\":\"This model's maximum context length is 65536 tokens\"}}"),
+        )
+        assertTrue("应提示内容过长，实际：$tooLong", tooLong.contains("太长"))
+
+        // 余额不足用 400 返回时也不能说成模型名
+        val balance = OpenAiService.aiFailureHint(
+            HttpStatusException(400, "{\"error\":{\"message\":\"Insufficient Balance\"}}"),
+        )
+        assertTrue("应提示余额，实际：$balance", balance.contains("余额"))
+    }
+
+    @Test
+    fun `输入超长与输出被截断给出不同建议`() {
+        // 这两件事用户该做的动作完全不同：
+        //  - 输入超长 → 给的内容少一点 / 开新对话（历史压缩由 compaction 接缝自动做，走到这条说明也没救回来）
+        //  - 输出被 max_tokens 截断 → 让 AI 少输出一点 / 把需求拆小（换更短的历史毫无帮助）
+        // 改造前两者被压成同一句「这次内容太长了，换个短一点的问题再试」，对后者纯属误导。
+        val outputTruncated = OpenAiService.aiFailureHint(
+            HttpStatusException(
+                400,
+                "{\"error\":{\"message\":\"max_tokens is too large: 8192. " +
+                    "This model supports at most 4096 completion tokens\"}}",
+            ),
+        )
+        assertTrue("应指向输出上限，实际：$outputTruncated", outputTruncated.contains("输出"))
+
+        val inputTooLong = OpenAiService.aiFailureHint(
+            HttpStatusException(
+                400,
+                "{\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. " +
+                    "Please reduce the length of the messages\"}}",
+            ),
+        )
+        assertTrue("应提示内容太长，实际：$inputTooLong", inputTooLong.contains("太长"))
+        assertFalse("输入超长不该被说成输出问题：$inputTooLong", inputTooLong.contains("输出"))
+    }
+
+    @Test
+    fun `本机工具声明不合法不得误导为配置问题`() {
+        // 2026-09-15 真机事故原文：update_plan 的 steps 被写成 JSON 数组，服务端整体拒绝。
+        // 这类错误的正确处置是「导出日志反馈」，而不是让用户去改密钥/模型名/地址。
+        val hint = OpenAiService.aiFailureHint(
+            HttpStatusException(
+                400,
+                "{\"error\":{\"message\":\"Invalid schema for function 'update_plan': " +
+                    "[{\\\"type\\\":\\\"object\\\"}] is not of types \\\"boolean\\\", \\\"object\\\"\"}}",
+            ),
+        )
+        assertTrue("应指出工具声明不合法，实际：$hint", hint.contains("工具声明"))
+        assertFalse("不得误导用户去改模型名，实际：$hint", hint.contains("模型名"))
+        assertFalse("不得误导用户去改密钥，实际：$hint", hint.contains("密钥"))
+        assertFalse("不得误导用户去改地址，实际：$hint", hint.contains("地址"))
+    }
+
+    @Test
+    fun `限流与 5xx 都带状态码且不误导为配置问题`() {
+        assertTrue(OpenAiService.aiFailureHint(HttpStatusException(429, "")).contains("频繁"))
+        val server = OpenAiService.aiFailureHint(HttpStatusException(503, ""))
+        assertTrue("5xx 应带状态码便于排查，实际：$server", server.contains("503"))
+        assertFalse("5xx 不该误导用户去改配置", server.contains("设置"))
+    }
+
+    /**
+     * 网络类异常**分流**（2026-10-09 行为变更）。
+     *
+     * ★ 这条原先名叫「网络类异常仍回落通用文案」，断言 SocketTimeoutException 得到
+     * 「抱歉，AI 服务暂时不可用。」—— 它锁的正是本次要改掉的缺陷：
+     * 用户无法分辨是**手机没网**、**超时**、**证书/代理问题**还是**服务商挂了**，
+     * 而这几类的用户动作完全相反（连网 / 等一等 / 换网络 / 等服务商）。
+     *
+     * 代价：超时文案仍会被重试耗尽后才出现（retryAttempts=3 × 30s），
+     * 但那句话现在能告诉用户"该检查网络"，而不是让人干等。
+     */
+    @Test
+    fun `网络类异常按类型分流且不含换行`() {
+        val timeout = OpenAiService.aiFailureHint(java.net.SocketTimeoutException("timeout"))
+        assertTrue("超时应说清是超时，实际：$timeout", timeout.contains("超时"))
+        assertFalse("超时不该说成通用不可用（用户无法判断该做什么）", timeout.contains("服务暂时不可用"))
+
+        val unknownHost = OpenAiService.aiFailureHint(java.net.UnknownHostException("api.deepseek.com"))
+        assertTrue(
+            "域名解析失败应指向网络或接口地址，实际：$unknownHost",
+            unknownHost.contains("网络") || unknownHost.contains("接口地址"),
+        )
+
+        val ssl = OpenAiService.aiFailureHint(javax.net.ssl.SSLException("handshake failed"))
+        assertTrue("证书问题应指向证书/代理，实际：$ssl", ssl.contains("证书"))
+
+        // 眼镜 TTS 直接朗读：换行会被念成停顿错乱
+        listOf(timeout, unknownHost, ssl).forEach {
+            assertFalse("提示不应含换行：$it", it.contains("\n"))
+            assertTrue("提示过长（${it.length}）：$it", it.length <= 45)
+        }
+    }
+
+    /**
+     * 未知异常仍回落通用文案（分流不能变成"什么都给具体提示"）。
+     *
+     * ⚠️ 这条判据的另一半：**不能过度分流**。给一个根本不是网络问题的异常
+     * 贴上"请检查手机网络"是**误导性提示**，比通用文案更糟 —— 用户会去查一个
+     * 不存在的问题。所以只认已知的几个具体类型，其余老实回落。
+     */
+    @Test
+    fun `未知异常仍回落通用文案`() {
+        assertEquals(
+            "抱歉，AI 服务暂时不可用。",
+            OpenAiService.aiFailureHint(IllegalStateException("boom")),
+        )
+    }
+
+    /**
+     * 配额耗尽必须说清是账单问题（2026-10-09）。
+     *
+     * OpenAI 系用 `insufficient_quota`，DeepSeek 系用 `insufficient balance` —— **两个不同的词**。
+     * 漏掉前者会落到 429「太频繁了，稍等一会儿」，让用户干等，而真因是配额用完（等也没用）。
+     */
+    @Test
+    fun `insufficient_quota 指向配额而非限流`() {
+        val quota = OpenAiService.aiFailureHint(HttpStatusException(429, "insufficient_quota"))
+        assertTrue("应指出配额/余额，实际：$quota", quota.contains("配额") || quota.contains("余额"))
+        assertFalse("不该说成'太频繁，稍等一会儿'（等也没用），实际：$quota", quota.contains("频繁"))
+    }
+
+    @Test
+    fun `提示面向眼镜朗读故不含换行且长度有界`() {
+        // 眼镜 TTS 直接朗读该文案：出现换行会被念成停顿错乱，过长则播报冗长。
+        // 上限取「一句话」的宽松界（45 字），既能拦住误粘贴长文案，又不会因正常措辞微调而误报。
+        listOf(400, 401, 402, 404, 429, 500).forEach { code ->
+            val hint = OpenAiService.aiFailureHint(HttpStatusException(code, "x".repeat(2000)))
+            assertFalse("HTTP $code 的提示不应含换行：$hint", hint.contains("\n"))
+            assertTrue("HTTP $code 的提示过长（${hint.length}）：$hint", hint.length <= 45)
+        }
+    }
+}

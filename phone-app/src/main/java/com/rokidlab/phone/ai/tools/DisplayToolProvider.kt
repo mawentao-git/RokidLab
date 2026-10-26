@@ -1,0 +1,297 @@
+package com.rokidlab.phone.ai.tools
+
+import com.rokidlab.phone.R
+import com.rokidlab.phone.ai.ToolRisk
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.util.Base64
+import android.util.Log
+import com.rokid.cxr.Caps
+import com.rokidlab.phone.ai.GlassToolConfirmChannel
+import com.rokidlab.phone.ai.MusicPlayerController
+import com.rokidlab.phone.ai.ToolRegistry
+import com.rokidlab.phone.glasses.AiChannel
+import com.rokidlab.phone.glasses.ChartGlassPush
+import com.rokidlab.phone.glasses.GlassesHandshake
+import com.rokidlab.phone.glasses.LinkProtocol
+import com.rokidlab.phone.platform.ProotShell
+import com.rokidlab.phone.store.ChatStateHolder
+import com.rokidlab.phone.util.decodeSampledBitmap
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * 屏幕展示域工具（Phase X）：目前仅含 `show_image` —— 把一张图片渲染到手机端对话气泡里，
+ * 并在眼镜已连接时同步到眼镜端悬浮图片层（12s 自动消失）；眼镜端失败不影响手机端。
+ *
+ * 实现要点：
+ * - 不返回 Markdown / 文本给模型：模型拿到的是**如实的状态文本**（含眼镜端是否同步成功）。
+ * - 图片来源两种：http/https 直链，或容器内文件（`/mnt/lab`、`/mnt/download`，如拍照落盘与
+ *   ffmpeg 产物）。本地路径经 [ProotShell.hostFileForGuestPath] 解析成宿主文件后**直接读盘**，
+ *   手机气泡与眼镜下发的字节都取自同一份文件，不经网络。
+ * - 真正产生手机端 UI 副作用的是 ChatStateHolder.addImage —— 把带 imageUrl 的 ChatMsg 加进全局
+ *   消息列表，[ChatBubble] 检测到 imageUrl 时通过 [com.rokidlab.phone.store.ChatImageCache] 异步下载并渲染。
+ * - ChatStateHolder 是 Compose 快照线程，工具运行在 worker 线程（见 ToolGateway.call），必须切主线程写入。
+ */
+internal object DisplayToolProvider : ToolProvider {
+    private const val TAG = "DisplayToolProvider"
+
+    override val toolNames = setOf("show_image", "push_chart_to_glasses")
+
+    override fun tools(): List<ToolEntry> = listOf(
+        ToolEntry(
+            name = "show_image",
+            group = ToolRegistry.DOMAIN_DISPLAY,
+            displayNameRes = R.string.ai_tool_show_image_name,
+            descriptionRes = R.string.ai_tool_show_image_desc,
+            risk = ToolRisk.LOCAL_SIDE_EFFECT,
+            statusText = "正在显示图片…",
+            // ⚠️ 2026-10-09 补：它会往眼镜下发一个**只能显示一个**的浮层（同一次多调互相顶掉）
+            //   并在手机气泡里插消息，原先漏标 ⇒ 并行执行时进度与实际显示错位。
+            sideEffect = true,
+            schema = toolSchema(
+                name = "show_image",
+                description = "显示一张图片：默认渲染在手机端对话气泡里；若眼镜已连接，会同时同步到眼镜端悬浮显示（约 12 秒后自动消失）。" +
+                    "当用户说“显示图片”“显示封面”“给我看张图”“把刚才那张图发出来”时调用。" +
+                    "imageUrl 支持两种：① http/https 直链；② 容器内文件路径（/mnt/lab/、/mnt/download/ 下已存在的图片，如拍照落盘、ffmpeg 处理后产物），" +
+                    "本地文件**不需要**先上传，直接传容器路径即可。" +
+                    "若用户只说“显示封面”或想看在播歌曲的封面，可以不传 imageUrl，会自动显示当前播放歌曲的封面。",
+                parameters = mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "imageUrl" to mapOf(
+                            "type" to "string",
+                            "description" to "图片地址：http/https 直链，或容器内路径（/mnt/lab/xxx.jpg、/mnt/download/xxx.png）。用户没给时可省略，仅在播放歌曲时会退回显示当前歌曲封面。",
+                        ),
+                        "caption" to mapOf("type" to "string", "description" to "图片下方的说明文字（可选），如“这是一只小狗”。"),
+                    ),
+                ),
+            ),
+        ),
+        ToolEntry(
+            name = "push_chart_to_glasses",
+            group = ToolRegistry.DOMAIN_DISPLAY,
+            displayNameRes = R.string.ai_tool_push_chart_name,
+            descriptionRes = R.string.ai_tool_push_chart_desc,
+            risk = ToolRisk.LOCAL_SIDE_EFFECT,
+            statusText = "正在推送图表到眼镜…",
+            // ⚠️ 2026-10-09 补：同 show_image —— 眼镜全屏浮层是单槽位，且附带渲染开销，
+            //   并行执行会导致眼镜端串行错位（同一次多次调用互相顶掉）。
+            sideEffect = true,
+            schema = toolSchema(
+                name = "push_chart_to_glasses",
+                description = "把一张 ECharts 图表推到眼镜全屏显示（渲染成图片）。当用户要求在眼镜上看图表/K线/走势图，或说“把刚才的图表推到眼镜”时调用。option 传完整的 ECharts option JSON（与 echarts 代码块相同格式）；若对话里刚生成过图表卡片，直接复用那份 option。",
+                parameters = mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "option" to mapOf("type" to "string", "description" to "完整的 ECharts option JSON。K线用 candlestick，数据格式 [开盘,收盘,最低,最高]。"),
+                        "title" to mapOf("type" to "string", "description" to "图表标题（可选），显示在眼镜端顶部。"),
+                    ),
+                    "required" to listOf("option"),
+                ),
+            ),
+        ),
+    )
+
+    override fun execute(context: Context, name: String, args: JSONObject): String {
+        return when (name) {
+            "show_image" -> showImage(context, args)
+            "push_chart_to_glasses" -> pushChartToGlasses(context, args)
+            else -> throw IllegalArgumentException("未知工具: $name")
+        }
+    }
+
+    /**
+     * push_chart_to_glasses：把一张 ECharts 图表离屏渲染成图片推到眼镜端全屏查看器
+     * （Cap.CHART_VIEW；滑动切换/单击重发/双击退出，见 ChartGlassPush 与眼镜端
+     * ChartViewerController）。option 参数与对话里 ```echarts 代码块同格式，
+     * 模型刚画完图表时源码就在手上，直接复传即可。
+     */
+    private fun pushChartToGlasses(context: Context, args: JSONObject): String {
+        val option = args.optString("option").trim()
+        val title = args.optString("title").trim()
+        if (option.isEmpty()) {
+            return "没有可推送的图表：请传完整的 ECharts option JSON"
+        }
+        // option 必须是合法 JSON：坏 JSON 渲染必白屏，提前拦下并让模型修正重试
+        val valid = runCatching { JSONObject(option) }.isSuccess
+        if (!valid) {
+            return "option 不是合法 JSON：请修正后再调用本工具"
+        }
+        return ChartGlassPush.pushBlocking(context, option, title)
+    }
+
+    private fun showImage(context: Context, args: JSONObject): String {
+        var rawUrl = args.optString("imageUrl").trim()
+        var caption = args.optString("caption").trim()
+        // 未给链接时兜底：显示当前播放歌曲的封面（覆盖“显示封面”“看下封面”这类说法）
+        if (rawUrl.isEmpty()) {
+            val cover = MusicPlayerController.currentCoverUrl
+            if (cover.isNotBlank()) {
+                rawUrl = cover
+                if (caption.isBlank()) {
+                    caption = listOf(MusicPlayerController.currentTitle, MusicPlayerController.currentArtist)
+                        .filter { it.isNotBlank() }
+                        .joinToString(" - ")
+                }
+            }
+        }
+        if (rawUrl.isEmpty()) {
+            return "没有可显示的图片：请提供图片链接或 /mnt/lab/ 下的图片路径，或先播放一首歌"
+        }
+        // 两种来源：http/https 直链，或容器内文件（/mnt/lab、/mnt/download，如拍照落盘 / ffmpeg 产物）。
+        // 本地路径解析成宿主文件：气泡直接读盘（ChatImageCache 对非 http 路径走本地读，与聊天附件同通道）、
+        // 眼镜端直接读字节，都不走网络。
+        val normalized = rawUrl.lowercase()
+        val isHttp = normalized.startsWith("http://") || normalized.startsWith("https://")
+        val localFile = if (isHttp) null else ProotShell.hostFileForGuestPath(context, rawUrl)
+        if (!isHttp && localFile == null) {
+            return "图片路径不合法（仅支持 http/https 链接，或 /mnt/lab/、/mnt/download/ 下已存在的图片文件）"
+        }
+        val mainHandler = Handler(Looper.getMainLooper())
+        mainHandler.post {
+            ChatStateHolder.addImage(
+                isUser = false,
+                imageUrl = localFile?.absolutePath ?: rawUrl,
+                caption = caption.ifBlank { "图片" },
+            )
+        }
+        Log.i(TAG, "show_image queued: ${localFile?.absolutePath ?: rawUrl} caption='$caption'")
+        // 同步镜像到眼镜端悬浮图片层（手机端显示为主，眼镜端失败不影响手机端）。
+        // ★ 必须把眼镜端结果如实回给模型：旧实现无论成败都返回「已显示图片」，
+        //   于是眼镜没连/没跑 RokidLink 时模型照样说"已显示"，用户看到的是"说了没反应"。
+        return when (val push = pushImageToGlasses(context, rawUrl, caption.ifBlank { "图片" }, localFile)) {
+            GlassesPush.OK ->
+                if (caption.isNotBlank()) "已显示图片（手机端 + 眼镜端）：$caption" else "已显示图片（手机端 + 眼镜端）"
+            GlassesPush.NOT_CONNECTED -> "已在手机端显示图片；眼镜端未连接，未能同步到眼镜"
+            GlassesPush.APP_NOT_READY -> "已在手机端显示图片；眼镜端未就绪（RokidLink 未运行或未握手），未能同步到眼镜"
+            GlassesPush.UNSUPPORTED -> "已在手机端显示图片；眼镜端版本不支持图片显示，仅手机端可见"
+            GlassesPush.FAILED -> "已在手机端显示图片；同步到眼镜端失败"
+        }
+    }
+
+    /** 眼镜端下发结果（用于向模型/用户如实回报，不再静默吞掉失败） */
+    private enum class GlassesPush { OK, NOT_CONNECTED, APP_NOT_READY, UNSUPPORTED, FAILED }
+
+    /** 眼镜端下发通道的 Base64 体积上限（超过则降规格或放弃，避免自定义指令下发失败） */
+    private const val MAX_B64_CHARS = 400_000
+
+    /**
+     * 把图片下发到眼镜端悬浮图片层（[AiChannel.TOPIC_SHOW_IMAGE]）。
+     *
+     * 眼镜端不保证能自己上网，故由手机端下载 → 压到长边 ≤480px 的 JPEG → Base64 后经
+     * CXR 自定义指令下发；眼镜端解码成 Bitmap 显示 12s。
+     *
+     * 眼镜未连接 / 版本不支持该能力（[LinkProtocol.Cap.SHOW_IMAGE]）/ 下发失败：只记日志，
+     * 不影响手机端对话气泡的正常显示。
+     *
+     * ★ 眼镜端 `RokidLink` 没在跑时必须先经 ADB 拉起它（见 [ToolRegistry.ensureGlassesLinkRunning]）：
+     *   CXR 自定义指令**只有 RokidLink 订阅着才能收到**，进程不在 = 指令石沉大海；
+     *   而它在 `adb install -r` 之后是 `stopped=true`（无 BOOT_COMPLETED），不拉起来本功能必然"说了没反应"。
+     */
+    private fun pushImageToGlasses(
+        context: Context,
+        imageUrl: String,
+        caption: String,
+        localFile: File? = null,
+    ): GlassesPush {
+        // 注意：本方法**同步**执行（下载 + 压缩 + 下发），以便把真实结果回给模型。
+        // 工具本身运行在 worker 线程（见 ToolGateway.call），不会卡主线程。
+        var capSupport = GlassesHandshake.supports(LinkProtocol.Cap.SHOW_IMAGE)
+        if (capSupport == false) {
+            Log.i(TAG, "glasses does not support show_image (old build), skip glasses push")
+            return GlassesPush.UNSUPPORTED
+        }
+        var session = GlassToolConfirmChannel.global.liveSession()
+        var link = session?.cxrLink
+        // 会话不在 / 未握手（capSupport == null 基本等价于 RokidLink 进程没跑）→ 拉一次服务再重试。
+        if (session == null || link == null || capSupport == null) {
+            if (ToolRegistry.ensureGlassesLinkRunning(context)) {
+                // 无界面启动前台服务通常 <1.5s 完成并回 HELLO 握手，等一小会儿再复查。
+                runCatching { Thread.sleep(1500) }
+                capSupport = GlassesHandshake.supports(LinkProtocol.Cap.SHOW_IMAGE)
+                session = GlassToolConfirmChannel.global.liveSession()
+                link = session?.cxrLink
+                Log.i(TAG, "after ensureGlassesLinkRunning: capSupport=$capSupport session=${session != null}")
+            }
+        }
+        if (session == null || link == null) {
+            Log.i(TAG, "glasses not connected, skip glasses push (capSupport=$capSupport)")
+            return GlassesPush.NOT_CONNECTED
+        }
+        val b64 = encodeForGlasses(imageUrl, localFile) ?: return GlassesPush.FAILED
+        val target = link
+        val targetSession = session
+        return runCatching {
+            val caps = Caps()
+            caps.write(AiChannel.CMD_SHOW_IMAGE)
+            caps.write(AiChannel.SCHEMA_VERSION.toString())
+            caps.write(b64)
+            caps.write(caption)
+            // persist 显式 "0"：AI 工具链路保持 12s 老行为（与设置页手动传图的 true 区分）
+            caps.write("0")
+            val r = targetSession.rawSendCustomCmd(target, AiChannel.TOPIC_SHOW_IMAGE, caps)
+            Log.i(TAG, "push image to glasses: base64Len=${b64.length} -> $r")
+            when {
+                r == 0 -> GlassesPush.OK
+                // 未握手（capSupport == null）又下发失败 → 多半是眼镜端 RokidLink 没在运行，
+                // 指令没有订阅者。区分出来便于用户知道「要去眼镜上打开一次 RokidLink」。
+                capSupport == null -> GlassesPush.APP_NOT_READY
+                else -> GlassesPush.FAILED
+            }
+        }.onFailure { Log.w(TAG, "push image to glasses failed: ${it.message}") }.getOrDefault(GlassesPush.FAILED)
+    }
+
+    /**
+     * 取图并按眼镜端通道规格压成 Base64 JPEG；失败/过大返回 null（静默跳过眼镜端）。
+     *
+     * @param localFile 非 null 时直接读本地文件（容器 /mnt/lab、/mnt/download 的宿主路径），
+     *   不走网络 —— 拍照落盘、ffmpeg 产物都由此下发。
+     */
+    private fun encodeForGlasses(imageUrl: String, localFile: File? = null): String? {
+        // 若正是当前播放歌曲的封面，直接复用播放器已下好的 Bitmap（320px），省一次网络往返。
+        val cached = MusicPlayerController.currentCoverBitmap
+            ?.takeIf { imageUrl == MusicPlayerController.currentCoverUrl }
+        val raw = cached ?: runCatching {
+            // 采样解码（M12）：下游 compressToBase64 最大只缩到 480（超限再降 320），
+            // 全量解码远端大图（可能是几 MB 的原图）纯浪费；1024 上限下幂二采样
+            // 实际落在 [512,1024]，缩到 480 质量无损。流先读字节供 bounds 探测。
+            val bytes = localFile?.readBytes() ?: (URL(imageUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 6000
+                readTimeout = 10000
+            }.inputStream.use { it.readBytes() }
+            decodeSampledBitmap(bytes, 1024)
+        }.onFailure {
+            Log.w(TAG, "glasses image load failed (${localFile?.absolutePath ?: imageUrl}): ${it.message}")
+        }.getOrNull()
+            ?: return null
+        var out = compressToBase64(raw, 480, 80)
+        if (out.length > MAX_B64_CHARS) out = compressToBase64(raw, 320, 65)
+        if (out.length > MAX_B64_CHARS) {
+            Log.w(TAG, "image too large for glasses channel (${out.length} chars), skip glasses push")
+            return null
+        }
+        return out
+    }
+
+    /** 长边缩到 maxSide 以内 → JPEG(quality) → Base64（NO_WRAP，避免换行破坏载荷）。 */
+    private fun compressToBase64(bmp: Bitmap, maxSide: Int, quality: Int): String {
+        val scaled = if (bmp.width <= maxSide && bmp.height <= maxSide) {
+            bmp
+        } else {
+            val ratio = maxSide.toFloat() / maxOf(bmp.width, bmp.height)
+            val w = (bmp.width * ratio).toInt().coerceAtLeast(1)
+            val h = (bmp.height * ratio).toInt().coerceAtLeast(1)
+            runCatching { Bitmap.createScaledBitmap(bmp, w, h, true) }.getOrDefault(bmp)
+        }
+        val bos = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    }
+}

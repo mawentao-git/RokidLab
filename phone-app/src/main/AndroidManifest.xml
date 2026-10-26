@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" tools:targetApi="34" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 保活：前台服务持有 WakeLock 防 CPU 挂起 → 防 HyperOS cgroup 冻结 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 开机自启：BOOT_COMPLETED 后由 BootReceiver 拉起保活服务，眼镜语音随开机恢复 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 电池优化白名单：请求豁免 Doze / 应用待机限制 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_HID_DEVICE" />
+    
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- AI 工具（通讯录查找/拨号前查号、日程查询与创建） -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- 拨号：有了它才能用 ACTION_CALL 直接拨出（全品牌一致）；未授权时自动退回 ACTION_DIAL -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- 短信：AI 工具 send_sms 直接发出（缺权限时现场拉起系统授权框） -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <!-- AI 工具（手机闹钟，normal 级权限无需运行时请求） -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- 定时任务精确触发：31/32 用 SCHEDULE_EXACT_ALARM（用户可撤销，需引导），
+         33+ 用 USE_EXACT_ALARM（安装即授予；本应用为提醒/闹钟类用途，侧载分发不受 Play 政策约束） -->
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        tools:targetApi="31" />
+    <uses-permission
+        android:name="android.permission.USE_EXACT_ALARM"
+        tools:targetApi="33" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 计步（get_step_count）：读 TYPE_STEP_COUNTER，Android 10+ 需身体活动权限 -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <!-- 本地模型：通过 RUN_COMMAND 在 Termux 中启动/停止 Ollama 服务 -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <!-- 双端录像：手机端 MediaRecorder 收麦克风（合成演示视频里的手机音轨） -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 本机执行环境：proot 容器的 /mnt/lab 直通公共「下载/Lab」目录（分区存储下 File 路径直读写必需） -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <queries>
+        <package android:name="com.rokid.sprite.global.aiapp" />
+        <package android:name="com.rokid.sprite.aiapp" />
+        <intent>
+            <action android:name="com.rokid.sprite.aiapp.externalapp.AUTHORIZATION" />
+        </intent>
+        <intent>
+            <action android:name="com.rokid.sprite.aiapp.externalapp.MEDIA_STREAM_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".app.LabApplication"
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Rokid Lab"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:usesCleartextTraffic="${cleartextTrafficPermitted}"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.RokidLabPhone"
+        tools:replace="android:theme,android:allowBackup,android:label">
+        <activity
+            android:name=".app.MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".mirror.ScreenMirrorActivity"
+            android:exported="false"
+            android:theme="@style/Theme.RokidLabPhone.Fullscreen" />
+
+        <activity
+            android:name=".filemanager.FileManagerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.RokidLabPhone" />
+
+        <activity
+            android:name=".hid.GamepadActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize"
+            android:theme="@style/Theme.RokidLabPhone.Fullscreen" />
+
+        <!-- 手机端 AIUI 全屏演示页：对话里的演示浮层点「全屏操作」进入。
+             触摸滑动/点击会翻译成眼镜上等价的方向键与回车（AIUI 页面只认键盘输入）。
+             configChanges 是为了不让旋转重建 —— WebView 里跑的是 20MB wasm 引擎，
+             重建一次要重新装载+重跑页面 onLoad。 -->
+        <activity
+            android:name=".aiui.AiuiDemoActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.RokidLabPhone.Fullscreen" />
+
+        <!-- 手机端浏览器页：browser_* 工具操作真实网站时的可见宿主。
+             launchMode=singleTask 是刻意的 —— 全 App 只允许一个浏览器窗口，
+             否则模型多调一次 browser_open 就会叠出第二个页面，而工具侧只认最后一个。
+             configChanges 避免旋转重建：重建会丢掉当前页面状态与已注入的编号表。 -->
+        <activity
+            android:name=".browser.BrowserActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.RokidLabPhone.Fullscreen" />
+
+        <!-- 本机网页预览全屏窗：WebView 必须在独立轻量 Activity 的 onCreate 里创建
+             （挂 Compose 树/Dialog 在真机上进不了渲染管线，2026-10-13 排查实录，
+             见 WebPreviewActivity 类注释）。标准 launchMode：最多 2 个预览各自独立开窗。 -->
+        <activity
+            android:name=".store.WebPreviewActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.RokidLabPhone.Fullscreen" />
+
+        <!-- 统一授权页：AI 工具在后台发现缺权限时，由 PermissionBridge 拉起本页
+             （前台直接弹系统授权框；后台凭悬浮窗豁免拉起；两者都不可用时退通知栏提醒）。
+             noHistory + excludeFromRecents：它只是"授权通道"，不该留在返回栈或最近任务里。 -->
+        <activity
+            android:name=".permission.PermissionRequestActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:noHistory="true"
+            android:theme="@style/Theme.RokidLabPhone.Transparent" />
+
+        <!-- 工具确认页（手机端确认通道）：需要用户点头的工具（发短信/删文件/装包/第三方 MCP 工具）
+             在**眼镜不可用时**由 PhoneToolConfirmChannel 拉起本页问一次。
+             眼镜在线时走眼镜悬浮层确认，不会弹本页。
+             noHistory + excludeFromRecents：它只是一次"问一句 → 答一句"的通道，不该留在返回栈里。 -->
+        <activity
+            android:name=".ai.approval.ToolConfirmActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:noHistory="true"
+            android:theme="@style/Theme.RokidLabPhone.Transparent" />
+
+        <!-- 用户选择页（ask_user 伪工具的界面部分）：模型需要用户拍板时弹出选项卡
+             （单选/多选/可自定义输入），作答经 AskUserChannel 回填给模型继续执行。
+             noHistory + excludeFromRecents：与 ToolConfirmActivity 同判据 ——
+             只是一次"问一句 → 答一句"的通道，不该留在返回栈里。 -->
+        <activity
+            android:name=".ai.AskUserActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:noHistory="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.RokidLabPhone.BottomSheet" />
+
+        <!-- MCP OAuth 回调落地页：浏览器完成授权后重定向 rokidlab://mcp/callback 拉起本页换 token。
+             ⚠️ exported=true 是必须的 —— 回调来自**浏览器进程**，与无障碍服务同理属于少数例外；
+             ⚠️ intent-filter 的 scheme/host/pathPrefix 必须与 McpOAuth.REDIRECT_URI 同步改。 -->
+        <activity
+            android:name=".ai.mcp.McpCallbackActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:theme="@style/Theme.RokidLabPhone.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="rokidlab"
+                    android:host="mcp"
+                    android:pathPrefix="/callback" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".glasses.PhoneInstallResultReceiver"
+            android:exported="false" />
+
+        <!-- 定时任务精确闹钟入口：Doze/省电策略下由系统 AlarmManager 准时唤醒并投递给保活服务执行 -->
+        <receiver
+            android:name=".adb.TimerAlarmReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".proactive.IdleCheckReceiver"
+            android:exported="false" />
+
+        <!-- 「走走拍拍」闹钟入口：Manifest 注册保证进程死后到点广播仍能拉起进程续链 -->
+        <receiver
+            android:name=".proactive.VisionTickReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.rokidlab.phone.proactive.VISION_TICK" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".proactive.NudgeCheckReceiver"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <service
+            android:name=".mirror.PhoneMirrorService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- 一次性截屏：投屏没开时「看手机屏幕」的取图路径（抓完即 stopSelf，不在状态栏常驻） -->
+        <service
+            android:name=".mirror.ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- 双端录像手机端：MediaProjection 录屏 + 麦克风收音，产物交 SideBySideCompositor 合成 -->
+        <service
+            android:name=".demo.PhoneScreenRecordService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- 无障碍服务：屏幕操作域（read_screen / tap_screen / swipe_screen / press_key / type_text）
+             与 **零弹窗截屏** 的前提 —— 用户在系统「设置 → 无障碍」里手动开一次，之后一直有效。
+             三条不可改的声明细节：
+             ① `android:permission=BIND_ACCESSIBILITY_SERVICE`：只有系统能 bind 我们。
+                漏了它，任何 App 都能 bind 这个服务 → 等于把"读屏 + 代点"公开出去。
+             ② `exported=true` + intent-filter：无障碍是**系统主动绑定**的，必须让系统能发现它。
+                （这是全项目少数必须 exported 的组件，改动时不要按"内部服务一律 false"的惯性收窄。）
+             ③ meta-data 指向 @xml/lab_accessibility_service：能力开关（截屏/手势/读窗）在那里声明，
+                漏了 meta-data 服务仍会连上，但**没有截屏与手势能力**，且调用时只报一个
+                "no accessibility access" 的错误码 —— 极难从现象反推这里。 -->
+        <service
+            android:name=".access.LabAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/lab_accessibility_service" />
+        </service>
+
+        <!-- 通知使用权服务：「消息摘要」主动能力的**事件源**。用户在系统「设置 → 通知使用权」
+             里手动开一次（走 PermissionRequestActivity 的直达页），之后一直有效。
+             与无障碍同形状，两条不可改的声明细节：
+             ① `android:permission=BIND_NOTIFICATION_LISTENER_SERVICE`：只有系统能 bind 我们。
+                漏了它，任何 App 都能 bind → 等于把"读全部通知内容"公开出去。
+             ② `exported=true` + intent-filter：通知使用权是**系统主动绑定**的，必须能被系统发现。
+             ⚠️ 未授权时系统根本不会 bind 本服务 —— 即"没授权 = 完全不采集"，
+                不存在先采集后判断的窗口。 -->
+        <service
+            android:name=".proactive.LabNotificationListenerService"
+            android:exported="true"
+            android:label="@string/notification_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 后台保活前台服务：通知栏常驻，保证 Lab 全部后台能力（语音助手/蓝牙 HID/ADB 工具/定时任务）不被系统回收 -->
+        <service
+            android:name=".keepalive.LabKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="keep_alive_background_services" />
+        </service>
+
+        <!-- 开机自启 + onTaskRemoved 闹钟重启入口（具体动作见 BootReceiver） -->
+        <receiver
+            android:name=".keepalive.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="com.rokidlab.phone.action.RESTART_KEEPALIVE" />
+            </intent-filter>
+        </receiver>
+        <!-- 媒体按键接收器：AVRCP Target 用 getActiveSessions(该组件) 挑选要上报的播放器，
+             缺它会导致眼镜「正在播放」/系统歌词页拿不到元数据 -->
+        <receiver
+            android:name=".music.LabMediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

@@ -1,0 +1,234 @@
+package com.rokidlab.phone.ai
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 工具风险表（[ToolRiskMap]）回归测试。
+ *
+ * 核心不变式（RULES §12.10）：`ToolRegistry.toolList` 里的每个工具都必须在 [ToolRiskMap] 登记 ——
+ * 漏登记历史上造成过严重事故：`save_code_file` 漏登记时兜底策略是「未登记 → 最保守档」，
+ * 于是 AIUI 代码生成工具被要求眼镜端确认 → 确认通道不可用即被拒 → **整条 AIUI 生成链路直接失败**
+ * （用户侧只看到「提示眼镜没权限 / 没反应」）。本测试让「漏登记」在 CI 就暴露，而不是在用户手上。
+ *
+ * ★ 接缝化后风险档是每个工具自己的声明字段（`ToolEntry.risk`），"漏登记"在结构上已不可能发生；
+ * `unregisteredTools()` 保留下来是为了让这条不变式断言继续有意义 —— 一旦有人把风险档从工具声明里
+ * 摘掉、或新增了绕过 provider 注册的工具，它会立刻不为空。
+ *
+ * ⚠️ 审批闸门相关的用例（per-source 限流、眼镜端确认、fail-open 三态、页面域白名单）已迁到
+ * `ai/approval/ApprovalGateTest` —— 那部分判定已从 `ToolPolicy` 收敛进 `ApprovalGate`。
+ */
+class ToolRiskMapTest {
+
+    @Test
+    fun `所有已注册工具都必须在风险表中登记`() {
+        // 直接读 toolList：若 ToolRegistry 初始化失败，这里必须显式失败，而不是让下面的自检空跑通过
+        assertTrue("工具表不应为空（否则自检形同虚设）", ToolRegistry.toolList.size >= 30)
+        assertEquals(
+            "存在未登记风险档位的工具（漏登记会让功能静默瘫痪）",
+            emptyList<String>(),
+            ToolRiskMap.unregisteredTools(),
+        )
+    }
+
+    @Test
+    fun `风险分级抽样：只读 本机副作用 未知`() {
+        assertEquals(ToolRisk.READ_ONLY, ToolRiskMap.riskOf("get_current_time"))
+        assertEquals(ToolRisk.READ_ONLY, ToolRiskMap.riskOf("read_code_file"))
+
+        assertEquals(ToolRisk.LOCAL_SIDE_EFFECT, ToolRiskMap.riskOf("save_code_file"))
+        assertEquals(ToolRisk.LOCAL_SIDE_EFFECT, ToolRiskMap.riskOf("show_image"))
+        assertEquals(ToolRisk.LOCAL_SIDE_EFFECT, ToolRiskMap.riskOf("call_phone"))
+
+        // 本机执行域的三档分野（2026-09-23 定档，判据与理由见 ShellToolProvider 的类注释）：
+        //  - run_shell 最坏只毁掉可重下的 rootfs、不提权 ⇒ LOCAL（对话路径静默执行是有意的）
+        //  - install_packages 会下几百 MB 外网流量、改容器状态 ⇒ EXTERNAL（必须过确认闸门）
+        //  - delete_script 删除不可恢复，与 delete_file 同级 ⇒ EXTERNAL
+        assertEquals(ToolRisk.LOCAL_SIDE_EFFECT, ToolRiskMap.riskOf("run_shell"))
+        assertEquals(ToolRisk.EXTERNAL_SIDE_EFFECT, ToolRiskMap.riskOf("install_packages"))
+        assertEquals(ToolRisk.EXTERNAL_SIDE_EFFECT, ToolRiskMap.riskOf("delete_script"))
+
+        // 完全不存在的名字（模型幻觉 / 攻击构造）必须保持最保守档
+        // （注意：它在审批链里会先被 UnknownToolGuard 拦下，见 ApprovalGateTest.B3/B4）
+        assertEquals(ToolRisk.EXTERNAL_SIDE_EFFECT, ToolRiskMap.riskOf("hallucinated_tool_xyz"))
+    }
+
+    /**
+     * 副作用标记与风险档的一致性（2026-10-02 体检补的护栏）：
+     * 两级调度按 `sideEffect` 分泳道（[AiConversationService] 的 runToolWorker）——
+     *  - `EXTERNAL_SIDE_EFFECT` 必须 `sideEffect=true`：不可逆动作失败不重试 + 串行泳道，
+     *    漏标会静默进入并行泳道，恰好复现"并发副作用工具"竞态（两弹窗互抢/进度行互覆）；
+     *  - `sideEffect=true` 的工具不得声明 `READ_ONLY`（自相矛盾：读工具不该改状态）。
+     * 注意单向不对称是**有意的**：LOCAL_SIDE_EFFECT 允许幂等工具 `sideEffect=false`
+     * （如 stop_tts 重放无害、show_image 只改显示），因此不做"非只读 ⇒ 必串行"的强断言。
+     */
+    @Test
+    fun `副作用标记与风险档一致性`() {
+        assertTrue("工具表不应为空（否则本断言形同虚设）", ToolRegistry.toolList.size >= 30)
+        // 判据走两张既有派生表：SIDE_EFFECT_TOOLS（由 ToolEntry.sideEffect 聚合）+ riskOf
+        val broken = ToolRegistry.toolList.map { it.name }.filter { name ->
+            val risk = ToolRiskMap.riskOf(name)
+            val serial = name in ToolRegistry.SIDE_EFFECT_TOOLS
+            (risk == ToolRisk.EXTERNAL_SIDE_EFFECT && !serial) || (serial && risk == ToolRisk.READ_ONLY)
+        }
+        assertEquals(
+            "副作用标记与风险档矛盾（漏标 sideEffect 会静默进入并行泳道引发竞态）",
+            emptyList<String>(),
+            broken,
+        )
+    }
+
+    /**
+     * 子代理工具的泳道判据（2026-10-09 补）。
+     *
+     * ## 为什么必须单独一条 —— 上面那条护栏**按设计抓不到**它
+     *
+     * 上面那条只强约束 `EXTERNAL_SIDE_EFFECT ⇒ sideEffect`，LOCAL 档是**有意放开**的
+     * （幂等工具如 `stop_tts` / `show_image` 重放无害，不该白占串行泳道）。
+     * 因此 LOCAL 档"该不该标 sideEffect"**只能逐个判断**，护栏帮不上忙 ——
+     * 而这正是 `execute_subtask` 漏标两个多月没被发现的原因。
+     *
+     * ## 判据：这个工具重放会不会产生**用户可见的重复**
+     *
+     * `execute_subtask` 把一整个多步本机任务派给子代理做，而任务里含
+     * `set_phone_alarm` / `manage_timer` 这类**累积性**动作 ⇒ 重放会设出多个重复提醒。
+     * 它因此必须与 `save_code_file` / `manage_knowledge_base` 同档处理。
+     *
+     * ⚠️ 漏标的两个后果都是真机上能观察到的（不是理论风险）：
+     *  - 进并行泳道 ⇒ 主代理可同时派 2 个 write 子代理（`SubagentSlots` 上限 2）
+     *    ⇒ 两个子代理并发写同一个项目目录；
+     *  - `maxAttempts` 仍是 3 ⇒ 瞬时失败时子代理里的设定时器被执行 3 次。
+     *
+     * 📌 这条测试锁的**不是**"子代理必须串行"这个结论，而是
+     *   "**能做累积性本机动作的工具不得只按 LOCAL 档放行并行**"这条判据 ——
+     *   将来若给子代理加了新的累积性动作（如批量改设置），这条仍会替它把关。
+     */
+    @Test
+    fun `写型子代理必须标 sideEffect（LOCAL 档护栏覆盖不到）`() {
+        val write = com.rokidlab.phone.ai.subagent.WriteSubagent.TOOL_NAME
+        assertTrue(
+            "$write 会派子代理执行设定时器/写文件这类不可幂等的动作，" +
+                "必须标 sideEffect ⇒ 走串行泳道 + 失败不重放；" +
+                "漏标会静默进并行泳道并重放 3 次",
+            write in ToolRegistry.SIDE_EFFECT_TOOLS,
+        )
+        // 反向：只读子代理**不该**被标 —— 它确实无副作用，
+        // 标了会白占串行泳道，把"两路并发调研"的能力砍掉一半
+        val read = com.rokidlab.phone.ai.subagent.ReadOnlySubagent.TOOL_NAME
+        assertFalse(
+            "$read 是纯只读调研，标 sideEffect 会白占串行泳道（并发收益减半）",
+            read in ToolRegistry.SIDE_EFFECT_TOOLS,
+        )
+    }
+
+    /**
+     * 无人值守安全不变式：定时自主任务只装配 [ToolRegistry.readOnlyToolNames]，
+     * 该名单里**绝不能**出现任何会改状态的工具 —— 无人监管时跑错一次
+     * （半夜拨号 / 装机 / 改设置）代价远高于「少做一点」。
+     *
+     * 新增工具时若把风险档登记错了（例如给 `call_phone` 标成 READ_ONLY），
+     * 本测试立刻失败，而不是等用户在半夜被拨出去一通电话。
+     */
+    @Test
+    fun `无人值守只读名单不含任何副作用工具`() {
+        val allowed = ToolRegistry.readOnlyToolNames()
+        assertTrue("只读名单不应为空（否则自主任务什么也查不了）", allowed.size >= 10)
+
+        // 有副作用的工具，一个都不能进（覆盖各域的代表：拨号/装机/写文件/改设置/定时/媒体/展示）
+        val mustBeExcluded = listOf(
+            "call_phone", "set_phone_alarm", "manage_calendar", "set_phone_volume",
+            "install_aiui_project", "open_aiui_app", "stop_aiui_app", "save_code_file",
+            "save_summary_txt", "manage_timer", "schedule_agent_task",
+            "control_music", "show_lyrics", "launch_glasses_app",
+            "open_phone_app", "show_image", "clear_agent_task",
+            // 短信：内容发出即不可撤回，且触达第三方号码（EXTERNAL_SIDE_EFFECT）
+            "send_sms",
+            // 剪贴板写入：改了系统共享状态，别的 App 下一次粘贴会拿到它
+            "write_clipboard",
+            // 本机执行：无人值守时**绝不允许**跑任意命令（它改的是真机上的文件，且不可预判）
+            "run_shell",
+            // 运行任务干预：写 stdin 可能触发程序内不可逆动作、停止/快照/恢复都改容器状态
+            //（list_runs / read_run_output 是只读，不在此列）
+            "write_run_input", "stop_run", "snapshot_container", "restore_container",
+            // 装包同理，且它还会下外网流量、失败会留下 dpkg 半配置状态
+            "install_packages",
+            // 脚本库同理：存/跑脚本就是跑命令的另一条写法（list_scripts 只读，不在此列）
+            "save_script", "run_script",
+            // 删脚本：删除不可恢复，无人值守时没人能确认
+            "delete_script",
+            // 联网写动作：POST/PUT/DELETE 会触达第三方，下载会往用户存储写文件
+            "http_request", "download_file",
+            // 压缩/解压：会往下载目录写文件（解压还会一次写出很多个）
+            "zip_files", "unzip_file",
+            // 截屏：会弹系统授权框、占用一次 MediaProjection 会话，无人值守时没法被确认
+            "capture_screen",
+            // 屏幕操作（无障碍域）：读屏会把用户屏幕上的一切（消息/余额/验证码）带进上下文，
+            // 点击/输入则是在整台手机上动手 —— 用户不在场时两件都不该发生。
+            // ⚠️ read_screen 是只读动作却登记在本机副作用档，正是为了落在这一行里（见 ScreenOpToolProvider 注释）
+            "read_screen", "tap_screen", "swipe_screen", "press_key", "type_text",
+            // 眼镜应用装/停/卸：改变眼镜系统状态、卸载不可恢复，无人值守时没人能确认
+            "manage_glasses_app",
+            // 从眼镜拷文件会在手机下载目录写文件（无人值守时虽然本机可撤销，但占蓝牙链路且不该背着用户动眼镜存储）
+            "download_glasses_file",
+            // 删日程：删除不可恢复；改日程与切主动行为开关：本机副作用但无人值守时不该背着用户动
+            "delete_calendar_event", "update_calendar_event", "manage_proactive",
+            // 查找手机：响铃是本机可即时撤销的动作，但它改了可听状态 —— 无人值守任务半夜
+            // 自作主张让手机响铃等于骚扰；停止权在用户的发送键上，无人值守没有这个键
+            "find_phone",
+        )
+        mustBeExcluded.forEach { name ->
+            assertTrue(
+                "副作用工具 $name 不得进入无人值守只读名单",
+                name !in allowed,
+            )
+        }
+
+        // 查询类能力必须真的可用，否则自主任务只能空口回复
+        listOf(
+            "get_current_time", "get_weather", "search_web", "fetch_webpage",
+            "search_knowledge_base", "get_agent_status", "search_past_conversations",
+            // 只读的手机侧查询：查应用清单不改变任何状态，必须能在无人值守时用
+            "list_phone_apps",
+            // 读剪贴板 / 解析文档：只读、不上传（PDF 走本机 OCR），同样必须能在无人值守时用
+            "read_clipboard", "parse_document",
+            // MCP server 清单：纯只读快照，自主任务排查「外部工具为什么调不了」时要用
+            "list_mcp_servers",
+        ).forEach { name ->
+            assertTrue("查询工具 $name 应在只读名单内", name in allowed)
+        }
+    }
+
+    /**
+     * 无人值守名单 = 只读名单 ∪ 本地媒体白名单，且白名单**只**放媒体。
+     *
+     * 背景：「16 点帮我放首《断桥残雪》」的定时自主任务原先装配纯只读工具集，
+     * `control_music` 被排除 → 模型看不到播歌工具，只能把歌名念到眼镜上，
+     * 用户侧表现为「明明有播歌工具却只跑到眼镜上」。本测试锁死修复后的边界：
+     *  - 放行本机可撤销的媒体工具（control_music）；
+     *  - 其余副作用工具（拨号/装机/写文件/设定时/开眼镜应用）依旧进不来；
+     *  - `show_lyrics` 仍不放行（它会拉起眼镜系统音乐页，越出"本机可撤销"的边界）。
+     */
+    @Test
+    fun `无人值守名单只比只读名单多放本地媒体`() {
+        val readOnly = ToolRegistry.readOnlyToolNames()
+        val unattended = ToolRegistry.unattendedToolNames()
+
+        assertEquals(
+            "增量必须与白名单完全一致",
+            ToolRegistry.UNATTENDED_MEDIA_ALLOWLIST,
+            unattended - readOnly,
+        )
+        assertTrue("放歌工具必须可用", "control_music" in unattended)
+        assertTrue("只读名单本身仍不含放歌工具（只读子代理不受影响）", "control_music" !in readOnly)
+
+        listOf(
+            "show_lyrics", "call_phone", "set_phone_alarm", "set_phone_volume",
+            "install_aiui_project", "open_aiui_app", "save_code_file",
+            "manage_timer", "schedule_agent_task", "launch_glasses_app", "show_image",
+        ).forEach { name ->
+            assertTrue("$name 不得借白名单之名进入无人值守名单", name !in unattended)
+        }
+    }
+}

@@ -1,0 +1,407 @@
+package com.rokidlab.phone.ai.approval
+
+import com.rokidlab.phone.ai.ToolRegistry
+import com.rokidlab.phone.ai.ToolRisk
+
+/**
+ * L4 agent/approval —— 内置策略源集合。
+ *
+ * ★ 顺序 = 求值顺序（先命中先返回）：
+ * 1. [PageScopeGuard] —— 页面域/黑名单（准入面最外层）
+ * 2. [UnknownToolGuard] —— 名字压根不存在
+ * 3. [ToolEnabledGuard] —— 用户把工具开关关掉了（全局）
+ * 4. [GroupScopeGuard] —— 当前聊天分组把该工具收窄了（2026-10-19 二期）
+ * 5. [UnattendedScopeGuard] —— 无人值守下的只读∪媒体白名单
+ * 6. [SourceRateLimitGuard] —— 限流（**有状态**，放在纯判定之后）
+ * 7. [PageElevatedDomainGuard] —— 页面调 shell/screen 域的强制确认（fail-closed）
+ * 8. [GlassesDependencyGuard] —— 本机模式下的眼镜依赖
+ * 9. [ShellStageGuard] —— run_shell 的分阶段审批（命令碰到真实用户数据才问）
+ * 10. [RiskApprovalGuard] —— 外部副作用 → 用户确认
+ *
+ * ⚠️ 顺序是有意的，不要随意重排：限流排在 guard 1–5 这些"纯判定"之后，被它们拒掉的
+ * 调用不占配额。⚠️ 但**不是所有被拒都不扣**（2026-09-30 审计更正，原文「统一为不扣」
+ * 与实现不符）：限流在 7/8 之前 —— 被眼镜依赖（本机模式）拒绝、或在用户确认环节
+ * 被取消/超时的调用，配额在 guard 6 已经扣了。影响可忽略（对话 120/min 的量级
+ * 远先碰不到上限），且把限流挪到确认**之后**反而更糟：确认等待是秒级阻塞，
+ * 等待期间同 source 的新调用会绕过限流直奔确认通道。
+ *
+ * 📌 [ShellStageGuard] 排在 [RiskApprovalGuard] 之前是"**更具体的判定优先**"：
+ *   两者的判定粒度不同（前者看"这条命令的哪几段危险"，后者看"这个工具整体是否危险"），
+ *   且当前不重叠（run_shell 是 LOCAL 档，不进 RiskApproval）。放前面让"首个 Ask 胜出"
+ *   的语义落在更精确的那个结论上 —— 将来若 run_shell 上调风险档，也不会出现
+ *   "先被笼统判为外部副作用、用户看不到具体是哪个阶段危险"的降级。
+ */
+internal object ToolGuards {
+
+    fun default(): List<ToolGuard> = listOf(
+        PageScopeGuard(),
+        UnknownToolGuard(),
+        ToolEnabledGuard(),
+        GroupScopeGuard(),
+        UnattendedScopeGuard(),
+        SourceRateLimitGuard(),
+        PageElevatedDomainGuard(),
+        GlassesDependencyGuard(),
+        ShellStageGuard(),
+        RiskApprovalGuard(),
+    )
+}
+
+/**
+ * AIUI 页面准入域（域白名单 + 黑名单）。只对 [ToolSource.AIUI_PAGE] 生效。
+ *
+ * 判定与文案都在 [PageScope]（与 `ToolGateway` 的页面入口校验**共用同一份**）——
+ * 这是"页面安全边界只有一个产地"的保证。
+ */
+internal class PageScopeGuard(
+    private val allowedDomains: Set<String> = PageScope.ALLOWED_DOMAINS,
+    private val denyTools: Set<String> = PageScope.DENY_TOOLS,
+    // ⚠️ 必须是 () -> Set<String>（惰性求值），不能是构造期快照：ApprovalGate.defaultGuards
+    // 是 by lazy 单例，若在构造时固化 knownTools，之后动态注册的 MCP 工具（用户新连一个
+    // server）就永远不在名单里，页面调用会被误判 "unknown tool" —— 而对话路径的
+    // UnknownToolGuard 用的是动态 lambda，两路径判定分叉。
+    private val knownTools: () -> Set<String> = PageScope::pageVisibleTools,
+    private val toolDomain: (String) -> String? = PageScope::domainOf,
+) : ToolGuard {
+
+    override val id: String = "page-scope"
+
+    override val sources: Set<ToolSource> = setOf(ToolSource.AIUI_PAGE)
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        val reason = PageScope.rejectReason(
+            toolName = ctx.name,
+            knownTools = knownTools(),
+            toolDomain = toolDomain,
+            allowedDomains = allowedDomains,
+            denyTools = denyTools,
+        ) ?: return null
+        return ToolDecision.Deny(DecisionOrigin.PAGE_SCOPE, reason)
+    }
+}
+
+/**
+ * 名字既不是真实工具、也不是伪工具 → 单调拒绝。
+ *
+ * ★ 这条修掉一个真实的白等：改造前对话路径**没有**这个判定，模型幻觉出一个工具名时
+ * （或历史里残留了已下线的工具名），会因为 `ToolRiskMap.riskOf` 的"未知名 = 最保守档"
+ * 被判成 EXTERNAL_SIDE_EFFECT → 触发确认闸门 → 眼镜在线时**白等 35 秒**问用户
+ * "是否执行 xxx"（用户一脸懵），超时后才由 `ToolRegistry.execute` 抛出"未知工具名"。
+ * 现在直接拒，理由是确定的。
+ *
+ * ⚠️ 已知工具 = 真实工具 ∪ **伪工具**（[PseudoTools]）。漏掉伪工具会让 `load_skill`
+ * 这类工具在接上闸门的瞬间被误拒 —— 单测锁死了这条。
+ */
+internal class UnknownToolGuard(
+    private val knownTools: () -> Set<String> = PseudoTools::knownToolNames,
+) : ToolGuard {
+
+    override val id: String = "unknown-tool"
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        if (ctx.name in knownTools()) return null
+        return ToolDecision.Deny(DecisionOrigin.UNKNOWN_TOOL, "unknown tool: ${ctx.name}")
+    }
+}
+
+/**
+ * 工具在设置页被用户**关掉**（[ToolRegistry.isEnabled] 为 false）→ 单调拒绝。
+ *
+ * ★ 这是 MCP 第三方工具**准入的实际落点**：它们的开关在首次报到时被
+ * [ToolRegistry.ensureDisabledByDefault] 写成显式 false，用户逐个打开才算授权。
+ *
+ * ⚠️ 为什么光靠"不下发 schema"不够：不下发只是**省 token**，模型仍可能从历史对话里
+ * 复述出一个工具名（或用户在页面上把 schema 缓存刷成旧的），此时执行侧不查开关
+ * 就真的把它跑了 —— 用户看到的开关形同虚设。装配侧（`schemasFor`）与执行侧
+ * （本 guard）必须用**同一份**开关状态判定，这条才算闭环。
+ *
+ * ⚠️ [ToolCallContext.enabled] 为 null 时**不表态**：那是"调用方没带开关状态"
+ * （单测、或没有 Context 的调用路径），不该因此把工具误判为被关掉。
+ */
+internal class ToolEnabledGuard : ToolGuard {
+
+    override val id: String = "tool-disabled"
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        val enabled = ctx.enabled ?: return null
+        if (enabled) return null
+        return ToolDecision.Deny(
+            DecisionOrigin.TOOL_DISABLED,
+            "工具 ${ctx.name} 未开启。请到「设置 → 乐奇工具」里打开它，或换用其他工具",
+        )
+    }
+}
+
+/**
+ * 工具在**当前聊天分组**被用户收窄（[com.rokidlab.phone.ai.GroupToolScope]）→ 单调拒绝。
+ *
+ * ★ 分组 = 一套独立 agent（2026-10-19 二期）。用户建「写小说」分组时排掉 shell/文件写
+ * 类工具防误触，排掉就是排掉：装配侧不下发 Schema 只省 token，模型仍可能从**历史对话**
+ * 里复述出该工具名（或别的分组里用过它）—— 执行侧不查就等于分组开关形同虚设。
+ * 本 guard 与 [ToolEnabledGuard] 是同一个论证的两层：全局开关一层、分组排除表一层。
+ *
+ * ⚠️ **只收窄不放宽**的方向由解析侧保证（[GroupToolScope] 是纯排除表），
+ * 本 guard 不做"这个工具全局关着但分组想开"的判断 —— 那种数据在结构上不存在。
+ *
+ * ⚠️ 只对 [ToolSource.CONVERSATION] 与 [ToolSource.AIUI_PAGE] 生效，**刻意排除**
+ * [ToolSource.MOTION_RULE]：头动规则是用户自己在设置里配的确定性动作（点头拨号），
+ * 与"当前聊天停在哪个分组"无关 —— 用户把聊天切到写作分组，不该顺便让他的
+ * 点头规则失效。且规则不是模型驱动的，排除它不构成模型能力逃逸口。
+ */
+internal class GroupScopeGuard : ToolGuard {
+
+    override val id: String = "group-scope"
+
+    override val sources: Set<ToolSource> = setOf(ToolSource.CONVERSATION, ToolSource.AIUI_PAGE)
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        val disabled = ctx.groupDisabled ?: return null
+        if (!disabled) return null
+        return ToolDecision.Deny(
+            DecisionOrigin.GROUP_SCOPE,
+            "工具 ${ctx.name} 未在当前聊天分组启用。可在会话列表里进入该分组的设置，" +
+                "放宽它的能力范围后重试；或换用其他工具",
+        )
+    }
+}
+
+/**
+ * 无人值守（定时自主任务）下的准入白名单：不在 [ToolRegistry.unattendedToolNames] 里的一律拒绝。
+ *
+ * ★ 与装配侧「同一份名单」：自主任务装配用的是 `schemasUnattended`（只读 ∪ 媒体白名单），
+ * 名单外的工具**压根没下发**。本 guard 防的是"模型凭记忆复述出一个没下发的工具名"——
+ * 无人监管时跑错一次（半夜拨号/装机/改设置）是真实不可逆代价，光靠"不下发"防不住。
+ *
+ * ⚠️ 只对 [ToolSource.CONVERSATION] 生效：自主任务的执行入口就是对话链路，
+ * AIUI 页面与头动规则都不存在"无人值守"这个状态。
+ */
+internal class UnattendedScopeGuard : ToolGuard {
+
+    override val id: String = "unattended-scope"
+
+    override val sources: Set<ToolSource> = setOf(ToolSource.CONVERSATION)
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        if (!ctx.unattended) return null
+        if (ctx.name in ToolRegistry.unattendedToolNames()) return null
+        return ToolDecision.Deny(
+            DecisionOrigin.UNATTENDED_SCOPE,
+            "自主任务只能用查询类工具（到点放歌除外）；${ctx.name} 需要你本人在场确认，本次不执行",
+        )
+    }
+}
+
+/**
+ * per-source 滑动窗口限流。
+ *
+ * - **AIUI 页面 30/min**：页面是模型生成的 .ink，可能死循环刷工具。
+ * - **对话路径 120/min**：人驱动的多轮 Agent 循环（一轮里多次读写文件 + 查资料是常态），
+ *   上限只用于兜底失控循环。
+ *
+ * ⚠️ 历史教训：曾对两个来源统一用 30/min，会打断正常的工具循环 ——
+ * 用户看到莫名的「调用过于频繁」。
+ *
+ * ⚠️ 本 guard **有状态**，必须是单例（[ToolGuards.default] 只构造一次）。
+ * 单测要隔离计数时注入新实例，不要复用生产实例。
+ */
+internal class SourceRateLimitGuard(
+    private val aiuiPageLimit: Int = 30,
+    private val conversationLimit: Int = 120,
+    private val windowMs: Long = 60_000L,
+    private val clock: () -> Long = System::currentTimeMillis,
+) : ToolGuard {
+
+    override val id: String = "rate-limit"
+
+    private val buckets = HashMap<String, ArrayDeque<Long>>()
+
+    private fun limitFor(source: ToolSource): Int =
+        if (source == ToolSource.AIUI_PAGE) aiuiPageLimit else conversationLimit
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        val limit = limitFor(ctx.source)
+        val accepted = synchronized(buckets) {
+            val now = clock()
+            val q = buckets.getOrPut(ctx.source.id) { ArrayDeque() }
+            while (q.isNotEmpty() && now - q.first() > windowMs) q.removeFirst()
+            if (q.size >= limit) {
+                false
+            } else {
+                q.addLast(now)
+                true
+            }
+        }
+        if (accepted) return null
+        return ToolDecision.Deny(
+            DecisionOrigin.RATE_LIMIT,
+            "工具调用过于频繁（每分钟上限 $limit 次），请稍后再试",
+        )
+    }
+}
+
+/**
+ * 「本机模式」下要求眼镜在线的工具 → 拒绝。
+ *
+ * ★ 这是 DSH `ctx.tools.guard()` 语义的直译：**单调最终拒绝**，任何后续策略
+ * （包括用户确认）都不能翻案 —— 用户已经明确说了"这次就在手机上聊"。
+ *
+ * ⚠️ 判据是**用户开关**（[ToolCallContext.localOnly]），不是"链路现在通不通"。
+ * 按链路状态自动拒绝会在蓝牙抖动时把功能表现为「被安全策略挡住」
+ * （2026-09-11 实测事故：用户已授权却打不出电话）。手动态语义明确、行为可预期。
+ *
+ * ⚠️ 只对 [ToolSource.CONVERSATION] 生效：AIUI 页面**没有"本机模式"这个状态**
+ * （页面要么跑在手机预览宿主 `AiuiWebHost`、要么跑在眼镜宿主 `AiuiLinkActivity`，
+ * 两者都意味着"设备就在手边"）。
+ *
+ * 📌 术语（2026-10-09 统一）：**「AIUI 页面」只指页面制品本身，不指运行端** ——
+ * 旧注释写成"AIUI 页面的代码就在眼镜上跑"，把页面与眼镜宿主划了等号，
+ * 而实际上手机预览宿主跑的是同一份页面代码。运行端请分别说
+ * **手机预览宿主（`AiuiWebHost`）** / **眼镜宿主（`AiuiLinkActivity`）**。
+ */
+internal class GlassesDependencyGuard : ToolGuard {
+
+    override val id: String = "glasses-required"
+
+    override val sources: Set<ToolSource> = setOf(ToolSource.CONVERSATION)
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        if (!ctx.localOnly || !ctx.requiresGlasses) return null
+        return ToolDecision.Deny(
+            DecisionOrigin.GLASSES_REQUIRED,
+            "现在是「本机模式」（不连接眼镜），${ctx.name} 需要眼镜在线才能用",
+        )
+    }
+}
+
+/**
+ * AIUI 页面调用 **shell / screen 域** → 强制用户确认（fail-closed）。
+ *
+ * ★ 这是 2026-10-01「带闸门开放」政策的另一半：`PageScope.ALLOWED_DOMAINS` 把这两个域
+ * 加回页面白名单（页面的工具清单可见、可调），本 guard 保证**每一次**页面调用都要用户点头
+ * —— 问不到用户（眼镜/手机确认通道都不可用）就拒绝，页面永远拿不到静默的
+ * 命令执行 / 触摸注入。对话路径不受本 guard 影响（只对 [ToolSource.AIUI_PAGE] 生效）。
+ *
+ * ## 位置为什么在 [SourceRateLimitGuard] 之后、[RiskApprovalGuard] 之前
+ *  - 放在纯判定 deny（unknown/disabled/unattended）之后：那些该直接拒的不浪费用户一次确认；
+ *  - 放在 [RiskApprovalGuard] 之前：**首个 Ask 胜出** —— 页面调 `install_packages`
+ *    （EXTERNAL + PROCEED fail-open）时会被本 guard 的 fail-closed Ask 拦下，
+ *    页面路径永远比对话路径更严，不会因 fail-open 语义倒挂出"页面不问就能装包"。
+ *
+ * ⚠️ 本 guard 无 IO、可单测；阻塞由 [ApprovalGate] 统一负责。
+ */
+internal class PageElevatedDomainGuard : ToolGuard {
+
+    override val id: String = "page-elevated-domain"
+
+    override val sources: Set<ToolSource> = setOf(ToolSource.AIUI_PAGE)
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        val domain = ctx.domain ?: return null
+        if (domain != ToolRegistry.DOMAIN_SHELL && domain != ToolRegistry.DOMAIN_SCREEN) return null
+        return ToolDecision.Ask(
+            DecisionOrigin.PAGE_ELEVATED,
+            ToolRegistry.summarizeToolCall(ctx.name, ctx.args),
+            failClosed = true,
+        )
+    }
+}
+
+/**
+ * 外部副作用工具 → 需要用户确认（[ToolDecision.Ask]）。
+ *
+ * 只负责"该问"这个判断；**怎么问、答不上来怎么办**由 [ApprovalGate] 统一处理
+ * （降级分流读工具的 [com.rokidlab.phone.ai.ToolConfirmPolicy]：`BLOCK` 问不到就拒、
+ * `PROCEED` 问不到就放行 —— **只有用户显式取消在两种情况下都拒**）。
+ * 把"问"和"答"分开是为了让本 guard 保持无 IO、可单测。
+ *
+ * [ToolDecision.Ask.prompt] 用 `ToolEntry.summarize` 生成 —— 摘要与工具定义同源，
+ * 改参数名时会顺手改到摘要，不会出现"摘要里读的 key 早就改名了，于是永远显示空"。
+ */
+/**
+ * `run_shell` 的**分阶段审批**（2026-10-09，对齐 Muse Code 的 staged approvals）。
+ *
+ * ## 存在的理由
+ *
+ * `run_shell` 定档 `LOCAL_SIDE_EFFECT`（对话路径静默执行）的原判据是「容器可丢弃」。
+ * 这条判据在容器范围内成立，但有一个盲区：容器里 `/mnt/lab` 是**内核直连到手机
+ * 「下载/Lab」真实文件夹**的绑定挂载（见 `FileWorkspace`）。于是 `rm -rf /mnt/lab/…`
+ * 删的是用户真实文件，却与 `rm -rf /tmp/x` 同档 ⇒ 都不问用户。
+ *
+ * 本 guard 在闸门里补上这一环：**按"命令碰到了谁的数据"分档**，
+ * 判定逻辑全部在 [ShellStageAnalyzer]（纯函数，有独立单测）。
+ *
+ * ## 与 [RiskApprovalGuard] 的分工（不要合并）
+ *
+ * | | 判定粒度 | 依据 |
+ * |---|---|---|
+ * | [RiskApprovalGuard] | **整个工具** | `ToolEntry.risk == EXTERNAL_SIDE_EFFECT` |
+ * | 本 guard | **同一条命令内的每个阶段** | 阶段的目标路径是否落在真实文件系统 |
+ *
+ * 同一个 `run_shell`：`rm -rf /tmp/x` 不问、`rm -rf /mnt/lab/…` 问 ——
+ * 这正是"按工具问"做不到的那件事。
+ *
+ * ## failClosed 为什么取 true（而不读工具的 confirmPolicy）
+ *
+ * 工具的 `confirmPolicy` 表达的是"**这个工具**问不到用户时怎么办"，
+ * 而本 guard 只在**已经判定为不可逆且作用于真实用户数据**时才产生 Ask ——
+ * 那个时点上"猜错了就照做"的代价是用户数据永久消失，与发短信同级。
+ * 所以这里显式 fail-closed，**不**复用工具的 LOCAL 档 `PROCEED` 声明：
+ * 那条声明是为"容器内的可重做操作"给的，不适用于它没预见到的情况。
+ * 出路与 `denyUnconfirmed` 的既有文案一致（打开 App 后重试 / 连眼镜确认）。
+ */
+internal class ShellStageGuard(
+    private val toolName: String = com.rokidlab.phone.ai.tools.ShellToolProvider.TOOL_RUN,
+) : ToolGuard {
+
+    override val id: String = "shell-stage"
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        if (ctx.name != toolName) return null
+        val command = ctx.args.optString("command")
+        if (command.isBlank()) return null
+        val stages = ShellStageAnalyzer.analyze(command)
+        if (!ShellStageAnalyzer.needsReview(stages)) return null
+        return ToolDecision.Ask(
+            origin = DecisionOrigin.SHELL_STAGE,
+            prompt = buildPrompt(stages),
+            // 不可逆 + 真实用户数据 ⇒ 问不到就不做（理由见类 KDoc）
+            failClosed = true,
+            // 审批文案只列要点头的那一步；但审计要能回答"其余阶段各自为什么放行"
+            stageEvidence = stages.map { "${it.raw} → ${it.resolution.wire}" },
+        )
+    }
+
+    /**
+     * 给用户看的文案。
+     *
+     * ⚠️ 刻意说清"这是删除**手机上的真实文件**"而不是"这条命令有风险"：
+     *   用户是唯一能判断"这个文件该不该删"的人，给他准确的靶子比给他一个危险等级有用。
+     */
+    private fun buildPrompt(stages: List<ShellStageAnalyzer.Stage>): String {
+        val dangerous = stages.filter { it.resolution.needsReview }
+        val head = if (dangerous.any { it.resolution == ShellStageAnalyzer.StageResolution.REVIEW_DANGEROUS }) {
+            "这条命令会删除或覆盖你手机上的真实文件（不是容器里的临时文件）"
+        } else {
+            "这条命令可能删除手机上的真实文件（其中有无法静态判断的部分）"
+        }
+        val detail = ShellStageAnalyzer.reviewSummary(stages)
+        return if (detail.isBlank()) head else "$head：$detail"
+    }
+}
+
+internal class RiskApprovalGuard : ToolGuard {
+    override val id: String = "risk-confirmation"
+
+    override fun evaluate(ctx: ToolCallContext): ToolDecision? {
+        if (ctx.risk != ToolRisk.EXTERNAL_SIDE_EFFECT) return null
+        return ToolDecision.Ask(
+            DecisionOrigin.RISK_CONFIRMATION,
+            ToolRegistry.summarizeToolCall(ctx.name, ctx.args),
+            // 问不到用户时放行还是拒绝 = **工具自己的声明**（ToolConfirmPolicy）：
+            // BLOCK（发短信 / 未信任的 MCP 工具）必须拒绝；PROCEED（删本机文件 / 容器装包）放行。
+            // ⚠️ 判据不再是「域 == MCP」—— 那让 send_sms（真发短信）与 call_phone（只开拨号盘）
+            // 共享了同一条静默放行路径。取值链：ToolEntry.confirmPolicy → 缺省按 risk 派生。
+            failClosed = ctx.failClosedConfirmation,
+        )
+    }
+}

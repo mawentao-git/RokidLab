@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BODY_SENSORS" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 眼镜摄像头录像（CameraRecordingController）：Camera1 + MediaRecorder 输出 mp4。
+         运行时授权走**标准弹窗**：MainActivity 启动时在蓝牙权限框之后链式申请
+         CAMERA + RECORD_AUDIO（一次只弹一个，避免互相取消），用户在眼镜屏幕上点「允许」，
+         授权持久生效。`adb pm grant` 只是开发机的快捷方式，分发给普通用户不依赖它；
+         未授权时录像如实回报，用户在眼镜上打开一次 RokidLink 即可补授。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 录像专用前台服务（CameraRecordingService，类型 camera|microphone）：
+         Android 11+ AppOps 对 CAMERA 是 MODE_FOREGROUND，必须有该类型 FGS 才算
+         "前台使用" ⇒ 否则 Camera.open 报 "disabled by policy"（真机定论）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- 「自定义图」需要知道官方助手页是否在前台：Rokid 眼镜助手页就是桌面表盘页
+         （com.rokid.os.sprite.launcher/.main.SpriteMainActivity），而 CXR SDK 只给连接态、
+         getRunningTasks 在 API 32 只返回自己 ⇒ 唯一可用途径是 UsageStats 的
+         ACTIVITY_RESUMED 事件。这是「特殊权限」，不会弹框，运行时由手机端经
+         `adb appops set com.rokidlab.rokidlink android:get_usage_stats allow` 下发
+         （与 SYSTEM_ALERT_WINDOW 同一机制）。拿不到时 AssistantPageWatcher 会禁用并
+         高声告警，功能降级为「对话活动触发」，不会静默失效。 -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions"
+        xmlns:tools="http://schemas.android.com/tools" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 开机自启常驻服务（见 BootReceiver）。
+         ⚠️ 实测边界（2026-09-18 真机）：本项**只覆盖设备重启**。
+         - `force-stop`（AssistServer 场景抢占强杀）会置 stopped=true 并清除 alarm/job，
+           stopped 的包连 BOOT_COMPLETED 也收不到 ⇒ 本项失效；
+         - `MY_PACKAGE_REPLACED` 同样打不进来 —— `adb install -r` 会先 `force-stop` 目标包
+           （`installPackageLI` → `pkg removed`），装完停在 stopped=true（实测接收器零日志）。
+           保留该 action 只为覆盖「运行中被更新」等其他路径，不要当兜底用。
+         ⇒ 上述两类场景的恢复由**手机端 ADB 外部拉起**承担：
+           phone-app `ai/ToolRegistry.ensureGlassesLinkRunning` +
+           `CxrLHiRokidSession.startGlassesServiceProbe`（`am start-foreground-service`
+           是 stopped=true 的唯一合法突破点，真机已验证）。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <queries>
+        <package android:name="mark.via.gp" />
+        <package android:name="com.rokid.minigame" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="RokidLink"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
+        
+        <!-- ⚠️ 主题必须是 Opaque（不透明纯黑），**不可**用Theme.RokidLink.Transparent：
+             Rokid 是绿光波导，只发绿光，「黑」= 不发光 = 看起来透明；
+             而 `windowIsTranslucent=true` / `windowBackground=@android:color/transparent`
+             是真透明，会把下层 Launcher 的品牌绿 `#99BA00` 透出来 ⇒ 页面底色发绿。
+             本页是**常驻前台**窗口（自启即前台，否则服务会被后台限制杀掉），
+             透明窗口等于长期漏底色。原判断"隐形入口就该透明"是反的。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.RokidLink.Opaque">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".PhoneMirrorActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize"
+            android:theme="@style/Theme.RokidLink.Opaque" />
+
+        <!-- 同上：纯中转页、连 setContentView 都没有，若用透明主题会是一整块漏底色窗口 -->
+        <activity
+            android:name=".ScreenMirrorIntentActivity"
+            android:exported="true"
+            android:theme="@style/Theme.RokidLink.Opaque" />
+
+        <!-- AIUI Web 宿主（官方 @yodaos-pkg/ink browser-integration + wasm）：
+             渲染 Lab 生成的 .aix，眼镜按键 / Lab 蓝牙手柄(HID→KeyEvent) 注入为 ink 输入。
+             exported=false：唯一启动方是同进程的 KeyButtonService（AiuiLinkActivity.open），
+             不对外暴露 —— 否则任何第三方可带任意 aix_path 拉起本宿主，
+             借页面 JS 桥直调手机端工具（工具数量见 ToolGateway）。
+
+             ⚠️ **这里曾长期写着 `android:screenOrientation="portrait"` 并被注释标注
+             「修绿边的关键」—— 该结论是反的，绿边恰恰是它造成的**（2026-10-04 修正）。
+             判据来自 `dumpsys SurfaceFlinger`（铁证，非像素猜测）：
+
+               ① 屏幕 HWC 真实模式是 **landscape 640x480**：
+                  `activeMode={width=640, height=480}`，display transform = **ROT_270**。
+                  「物理 480x640 竖屏」只是**上屏后的视觉方向**，HWC 全程按 640x480 工作。
+               ② 声明 portrait 后，窗口拿到 `480x640` 的 buffer，与 HWC 模式方向**相反**，
+                  SF 只能补一次变换把buffer 转回 640x480 再交给 display：
+                  `geomBufferSize=[0 0 480 640]  geomBufferTransform=4 (ROT_90)`
+                  `geomContentCrop=[0 0 640 480]`← 注意crop 宽高是**反的**，
+                  正是「buffer 480x640 被当 640x480 消费」的证据。
+               ③ 这一层额外旋转/缩放采样让窗口**最外 1~2px 与下层 Launcher 品牌绿
+                  `#99BA00`(153,186,0) 混合**，形成精确环绕全屏一圈的绿框。
+                  截图实测框色 `rgb(127,169,0)` ≈ `#99BA00`×暗，与该混合比值吻合；
+                  而页面自身绿是 `rgb(64,255,94)`（=设计主色 #40FF5E），两者完全不同，
+                  可排除「页面画的边框」。
+
+             ⇒ 修法＝**删掉 `screenOrientation="portrait"`**，让窗口与 HWC 模式同向
+               （640x480），SF 无需补变换 ⇒ 无插值 ⇒ 无绿边。
+               这也与两个已知无绿边的对照组完全一致：
+                 - 官方 AssistServer 窗口：不声明 orientation；
+                 - 本工程投屏页 `PhoneMirrorActivity`：只 `FLAG_FULLSCREEN`、无orientation
+                   （见其 onCreate，历史上就无绿边）。
+
+             ⚠️ 别再为「窗口不够大/没铺满」去加 OVERSCAN 或 FLAG_LAYOUT_NO_LIMITS：
+               `dumpsys window` 实测窗口已是 `mBounds=Rect(0,0-480,640)`（系统钳在 480x640，
+               超屏压根不生效），而 WebView 会被撑到 488 宽 ⇒ meta viewport=480 时浏览器
+               自动缩放 1.0167 ⇒ 内容被放大 2%，违反「保持 AIUI 原有尺寸」。
+             ⚠️ 也不必再加 `FLAG_FULLSCREEN` 对应的窗口尺寸补丁：那两条亮线是
+               Chromium 的canvas 焦点环（`outline: rgb(229,151,0) auto 1px`，
+               已由 `index.html` 的 `#ink-root{outline:none}` 消除，与窗口无关）。 -->
+        <activity
+            android:name=".AiuiLinkActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden"
+            android:theme="@style/Theme.RokidLink.Opaque" />
+
+        <!-- KeyButtonService 必须保持 exported=true：手机端经 ADB 隧道用
+             `am start-foreground-service -n com.rokidlab.rokidlink/.KeyButtonService`
+             拉起常驻服务（见 phone-app ai/ToolRegistry.ensureGlassesLinkRunning）。
+             实测（眼镜 RG_glasses，非 root shell）：非导出的服务 / 非导出 Activity
+             一律被拒（"Requires permission not exported from uid <app uid>"），
+             而签名级自定义权限同样会把 shell 挡在门外 —— 二者都会静默打断
+             「服务不在跑 → 所有 CXR 自定义指令石沉大海」这条关键路径，
+             故此项保留导出，安全性由 ROM 层安装来源与用户授权承担。 -->
+        <service
+            android:name=".KeyButtonService"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".BtTunnelService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- 录像专用前台服务：只在录像期间挂起（CameraRecordingController start/stop 配对），
+             AppOps 的 CAMERA MODE_FOREGROUND 检查靠它的 camera|microphone 类型放行 -->
+        <service
+            android:name=".CameraRecordingService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
+
+        <!-- 断线自愈重启接收器：KeyButtonService 检测到 cxr-service 分发路由 stale 后
+             经 AlarmManager 触发自杀重启（仅本应用内部广播，故 exported=false） -->
+        <receiver
+            android:name=".SelfRestartReceiver"
+            android:exported="false" />
+
+        <!-- HUD DSL 压测直推入口（调试专用，见 HudDebugReceiver 注释）：
+             用法 adb shell am broadcast，组件指向本 receiver，action 为
+             com.rokidlab.rokidlink.DEBUG_HUD，extra 传 act(apply/try/hide) 与 dsl(场景 JSON)。
+             不经手机链路直接把场景 DSL 推上屏，测元素/动画/表达式的真实硬件天花板。
+             exported=true 理由同 KeyButtonService（shell uid 才能投递）。 -->
+        <receiver
+            android:name=".HudDebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.rokidlab.rokidlink.DEBUG_HUD" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 开机 / 覆盖安装自启接收器。
+             为什么必须单独一个 receiver 而不是给 SelfRestartReceiver 加 intent-filter：
+             系统广播要求 exported=true，而 SelfRestartReceiver 的内部 action（SELF_HEAL_RESTART
+             会杀进程）一旦导出，任何第三方应用都能发一条广播让本进程自杀 —— 故二者按
+             「是否接收外部广播」拆开，各自保持最小暴露面。
+
+             ⚠️ 有意**不**声明 LOCKED_BOOT_COMPLETED / directBootAware：
+             那两个常驻服务都要读写 SharedPreferences（凭据加密存储，解锁前不可用），
+             应用整体也不是 direct-boot aware —— 在解锁前拉起只会启动失败或直接被推迟，
+             属于「加了也没用、还多一条失败日志」的路径。
+             非 direct-boot 应用的 BOOT_COMPLETED 本就在用户解锁后投递，眼镜上二者几乎同时。
+
+             ⚠️ 实际生效范围只有「设备重启」：覆盖安装与被强杀后包都是 stopped=true，
+             广播投不进来（真机实测）。详见上方 RECEIVE_BOOT_COMPLETED 的注释。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

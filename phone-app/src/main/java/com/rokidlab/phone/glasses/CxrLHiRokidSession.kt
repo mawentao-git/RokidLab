@@ -1,0 +1,1786 @@
+// Rokid SDK 的 sendCustomCmd 自带「注意 Caps 体积」的废弃标记，
+// 但这是当前唯一的下行通道，短期内不可能替换，故整文件抑制该告警。
+@file:Suppress("DEPRECATION")
+
+package com.rokidlab.phone.glasses
+
+import com.rokidlab.phone.app.*
+import com.rokidlab.phone.adb.*
+import com.rokidlab.phone.design.*
+import com.rokidlab.phone.filemanager.*
+import com.rokidlab.phone.mirror.*
+import com.rokidlab.phone.model.*
+import com.rokidlab.phone.network.*
+import com.rokidlab.phone.settings.*
+import com.rokidlab.phone.store.*
+import com.rokidlab.phone.util.*
+import com.rokidlab.phone.ai.GlassesRecordChannel
+import com.rokidlab.phone.ai.ToolRegistry
+import com.rokidlab.phone.ai.AiuiProject
+import com.rokidlab.phone.connection.ChannelPriority
+import com.rokidlab.phone.connection.ConnectionRoute
+import com.rokidlab.phone.R
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
+import com.rokid.cxr.link.CXRLink
+import com.rokid.cxr.link.callbacks.IGlassAppCbk
+import com.rokid.cxr.link.callbacks.IImageStreamCbk
+import com.rokid.cxr.link.utils.CxrDefs
+import com.rokid.cxr.Caps
+import com.rokid.cxr.session.CxrSessionManager
+import com.rokid.cxr.session.RokidAppStatus
+import com.rokid.sprite.aiapp.externalapp.auth.AuthResult
+import com.rokid.sprite.aiapp.externalapp.auth.AuthorizationHelper
+import com.rokid.sprite.aiapp.externalapp.auth.GlassPermission
+import com.rokidlab.phone.domain.AiConfig
+import com.rokidlab.phone.domain.CxrAppOperation
+import com.rokidlab.phone.platform.Capability
+import com.rokidlab.phone.platform.CapabilityProbe
+import java.io.File
+import kotlin.concurrent.withLock
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import java.util.ArrayDeque
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlinx.coroutines.runBlocking
+
+class CxrLHiRokidSession(
+    context: android.content.Context,
+    internal var onStatus: (String) -> Unit,
+    internal var onBusyChanged: (Boolean) -> Unit,
+    private var onConnectionChanged: (CxrConnectionState) -> Unit,
+    initialHostApp: RokidHostApp = RokidHostApp.DEFAULT,
+    /** 用于启动授权 Activity 的现代 ActivityResultLauncher，替代已废弃的 startActivityForResult */
+    private val authLauncher: ((Intent) -> Unit)? = null,
+    /** 长驻任务作用域（Application 级）：ASR 推送/轮询等不随 Activity 销毁取消。
+     *  配合保活前台服务，Activity 退后台/销毁后语音链路仍持续运行。 */
+    internal val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    /**
+     * 眼镜端 HELLO 握手通告回调（linkVersion，可能为 null）。
+     *
+     * 2026-10-24 启动引导 redesign：版本比对需要在**每次握手刷新时**重算
+     * 「眼镜端是否落后于内置版本」——连接建立后眼镜端服务就绪即上报，
+     * 只在 onCreate 算一次会 race（握手可能还没到）。
+     */
+    private var onGlassesHello: ((String?) -> Unit)? = null,
+) {
+    // ── Activity 泄漏防护 ──
+    // 本会话由 LabApplication（应用级单例）持有，若强引用 Activity，
+    // 保活模式下 Activity 销毁后仍被单例钉住无法回收（泄漏整棵 View 树）。
+    // 因此：仅持 application 级 Context + Activity 弱引用；
+    // 确需 Activity 的场景（授权页跳转/销毁检查）走 activityRef。
+    internal val appContext: android.content.Context = context.applicationContext
+    /** 弱引用 Activity：无界面恢复（Service/Application 构造）时为 null，activityRef.get() 均有空保护 */
+    private val activityRef = java.lang.ref.WeakReference(context as? AppCompatActivity)
+    /** 主线程调度：替代 activity.runOnUiThread（Activity 回收后仍可用） */
+    internal val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * 保活模式下 Activity 销毁时调用：解除回调对 Activity 方法引用的强引用。
+     * 后台链路（AI/ASR/轮询/投屏）不受影响继续运行，
+     * UI 回调降级为纯日志，下次打开 App 会重建会话恢复 UI。
+     */
+    fun detachUiCallbacks() {
+        onStatus = { msg -> LogCollector.i(TAG, msg) }
+        onBusyChanged = { }
+        onConnectionChanged = { }
+        onGlassesHello = null
+        Log.i(TAG, "UI callbacks detached (keep-alive background mode)")
+    }
+    companion object {
+        private const val TAG = "CxrLHiRokidSession"
+
+        /**
+         * 工具结果下行的硬上限（字符，R13）：RFCOMM 单帧 64KB，这里给 JSON 信封留足余量。
+         * 正常路径到不了 —— 网关 per-tool 40K / 通用 8K 两道闸在前；本值只兜"闸被绕过"。
+         */
+        private const val DOWNLINK_HARD_LIMIT_CHARS = 60_000
+        private const val PREFS_NAME = "cxr_l_auth"
+        private const val KEY_TOKEN_PREFIX = "token_"
+
+        private const val AUTH_ACTIVITY_CLASS = "com.rokid.sprite.aiapp.externalapp.auth.AuthorizationActivity"
+        private const val AUTH_ACTION = "com.rokid.sprite.aiapp.externalapp.AUTHORIZATION"
+        internal const val MEDIA_SERVICE_ACTION = "com.rokid.sprite.aiapp.externalapp.MEDIA_STREAM_SERVICE"
+        internal const val AUTH_TOKEN_EXTRA = "auth_token"
+        internal const val AUTH_PACKAGE_EXTRA = "auth_package"
+
+        /** 眼镜端镜腿按键触发的「拍照问 AI」指令通道 */
+        private const val PHOTO_ASK_CMD = "rokidlab_photo_ask"
+        /**
+         * AI 文字轮询通道（手机端 → 眼镜端）：定时 sendCustomCmd 轮询，
+         * 眼镜端可回复订阅返回 ASR 文字。请求-响应机制可绕过 AI App 对未知上行指令的过滤。
+         */
+        private const val AI_ASR_POLL_CMD = "rokidlab_ai_asr_poll"
+
+        /** 眼镜端 RokidLink 包名（存活探针用；与 ToolRegistry.ensureGlassesLinkRunning 同一目标） */
+        private const val GLASSES_LINK_PKG = "com.rokidlab.rokidlink"
+
+        /**
+         * 常驻服务存活探针的各段时序（详见 [startGlassesServiceProbe]）。
+         *
+         * 首轮等 [PROBE_FIRST_DELAY_MS]：连接建立时 [requestGlassesHello] 已发过一次 HELLO_REQ，
+         * 先给它留出应答时间，避免「刚连上就判死并拉起」。
+         */
+        private const val PROBE_FIRST_DELAY_MS = 8_000L
+
+        /**
+         * 探针周期。
+         *
+         * 取 60s：眼镜端被强杀是低频事件，而每次探针在「握手正常」时只花一条 CXR 空帧
+         * （不碰 ADB 隧道，不与投屏/文件提取争抢那条唯一的 RFCOMM）。
+         * 更短没有收益（真被杀了，晚 1 分钟恢复不影响可用性）。
+         */
+        private const val PROBE_INTERVAL_MS = 60_000L
+
+        /** 等待 HELLO 应答的窗口；与 GlassesHandshake.LEGACY_DETECT_DELAY_MS 同量级 */
+        private const val PROBE_ACK_TIMEOUT_MS = 4_000L
+        /** 开关补推（HELLO 世代同步）等眼镜端回执的上限：复用链路是同步回执，全链路重建路径最多 ~10s 超时，取 12s 兜底 */
+        private const val SWITCH_SYNC_TIMEOUT_MS = 12_000L
+
+        /** pidof 命令超时。比通用 15s 短：探针宁可快速放弃，也不要占着 ADB 会话 */
+        private const val PROBE_PIDOF_TIMEOUT_MS = 6_000
+
+        /**
+         * ADB 校验失败后的退避时长。
+         *
+         * 拿不到 pid 意味着「本轮无法验证」，而这一般是线路本身不通（无共享会话 / WiFi 与蓝牙
+         * 都不可达），此时每次重建都要付满 TCP+握手超时（最长 25s），一分钟一次纯属耗电。
+         * 退避只影响「验证步骤」，不影响探针本身 —— 握手一旦恢复刷新，探针立刻回到健康判定。
+         */
+        private const val ADB_VERIFY_BACKOFF_MS = 5 * 60_000L
+
+        /**
+         * 「ADB 不可达」时改走 CXR appStart 兜底的退避时长。
+         *
+         * 为什么它必须比探针周期（60s）长得多：[launchGlassesLinkViaCxr] 走
+         * `launchApp` → `connectAndRunCustomAppOperation`，该路径**首段就会
+         * `session.cleanup()` 拆掉并重建整条 CXR 链路**（timeout 30s）。
+         * 每分钟做一次等于每分钟把链路拆一次，纯自伤。5 分钟一次既够快恢复，
+         * 又把最坏情况的抖动限制在可接受范围。
+         */
+        private const val CXR_LAUNCH_BACKOFF_MS = 5 * 60_000L
+
+
+
+
+        /** OpenAI 兼容 AI 配置存储 */
+        internal const val AI_PREFS = "chat_prefs"
+        internal const val KEY_AI_BASE_URL = "ai_base_url"
+        internal const val KEY_AI_API_KEY = "ai_api_key"
+        internal const val KEY_AI_MODEL = "ai_model"
+        /** 对话模型模式键：official（官方乐奇）/ custom（Lab 自定义模型），持久化 + 下发眼镜端（值常量统一见 AiChannel.AI_MODE_*） */
+        internal const val KEY_AI_MODE = "ai_mode"
+        /** 拍照答题指令：答题时注入 AI 提示词控制回答方式 */
+        internal const val KEY_QUIZ_INSTRUCTION = "quiz_instruction"
+        /** 本地模型（Ollama）是否作为眼镜对话模型：true=对话仅走本机 Ollama；
+         *  与在线槽位（KEY_AI_BASE_URL/API_KEY/MODEL/MODE）相互独立，互不覆盖 */
+        internal const val KEY_AI_USE_LOCAL = "ai_use_local"
+        /** 当前选择的本地对话模型名（如 qwen2.5:0.5b） */
+        internal const val KEY_AI_LOCAL_MODEL = "ai_local_model"
+        /** 本地对话请求的用户自定义 JSON 参数（逐字段合并进每次本地请求体，如 {"think": false}；
+         *  空串=不附加。替代原「深度思考」布尔开关，兼容任何模型的调参需求） */
+        internal const val KEY_AI_LOCAL_PARAMS = "ai_local_params"
+        /** 旧版「深度思考」布尔开关键（已废弃，读取时自动迁移到 KEY_AI_LOCAL_PARAMS 后清除） */
+        internal const val KEY_AI_LOCAL_THINK_LEGACY = "ai_local_think"
+        /** 在线模型长思考开关（DeepSeek V4/V3.2 系生效）：默认关闭（推理吞预算→空轮）；
+         *  与发送键旁的「思考」切换按钮共享此键（ChatScreen 直接读写同一 prefs） */
+        internal const val KEY_AI_THINKING = "ai_thinking"
+        internal const val KEY_KEY_QUIZ_ENABLED = "key_quiz_enabled"
+        /** 「连续对话（多轮免唤醒）」开关：眼镜端每轮 Lab 回复的 TTS 播完后自动重开官方 AI 会话 */
+        internal const val KEY_KEY_CONTINUE_DIALOG = "chat_continue_dialog"
+
+        private fun tokenPrefKey(hostApp: RokidHostApp) = KEY_TOKEN_PREFIX + hostApp.packageName
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 内部状态字段 / UI 回调注册 / AI 配置（持久化与下发眼镜端）
+    // ═══════════════════════════════════════════════════
+
+    internal var hostApp: RokidHostApp = initialHostApp
+    internal var token: String? = null
+    internal var cxrLink: CXRLink? = null
+    internal var pendingOperation: CxrAppOperation? = null
+    internal var queryQueue: ArrayDeque<String> = ArrayDeque()
+    /** 查询安装状态结果：true=已安装，false=未安装，**null=查询失败（状态未知）** */
+    internal var onQueryResult: ((String, Boolean?) -> Unit)? = null
+    internal var onQueryComplete: (() -> Unit)? = null
+    internal var cxrlConnected = false
+    internal var glassBtConnected = false
+    internal var operationStarted = false
+    /** 防止超时与 operation.onReady 回调竞态 */
+    internal var operationCompleted = false
+    internal var timeoutJob: Job? = null
+
+    /**
+     * 眼镜端常驻服务存活探针（见 [startGlassesServiceProbe]）。
+     * 生命周期与本次链路一致：连接建立时启动，[cleanup] 时取消。
+     */
+    private var glassesProbeJob: Job? = null
+
+    /**
+     * ADB 校验退避截止时刻（见 [ADB_VERIFY_BACKOFF_MS]）。0 = 不处于退避中，每轮都校验。
+     * 只在探针协程内读写，协程单实例串行执行，故用 @Volatile 即可（无需额外同步）。
+     */
+    @Volatile
+    private var nextAdbVerifyAtMs = 0L
+
+    /** CXR appStart 兜底的退避截止时刻（见 [CXR_LAUNCH_BACKOFF_MS]）。0 = 可立即尝试。 */
+    @Volatile
+    private var nextCxrLaunchAtMs = 0L
+
+    // ── 行为类开关的眼镜端同步水位（手机端=真值源，眼镜端=执行器）──
+    //
+    // 背景（2026-10-24 用户实测「连续对话关了还能连续对话」）：开关状态存在两地 —
+    // 手机端 prefs（UI 读它）与眼镜端 prefs（AiTakeoverCoordinator 读它）。此前的唯一
+    // 同步渠道是「用户点击开关时推一次」，没有任何补推机制。于是：
+    //   ① 眼镜端 RokidLink 重装（引导/设置页的先卸后装）清掉它的 prefs
+    //      ⇒ chat_continue_dialog 回落默认 **true**，手机端显示"关"、眼镜端照旧续听；
+    //   ② 点击时的那一次下发失败（链路半开 / cxr-service 路由 stale）也不会自愈。
+    // 现在：HELLO 握手带上眼镜端进程启动标记（LinkProtocol.TOPIC_HELLO 第 4 字段），
+    // 见到新世代（或开关值变脏）就用轻量通道补推一遍（见 [syncBehaviorSwitchesToGlasses]）。
+    //
+    // 各字段语义：null=尚未推过/上次失败（下次 HELLO 必推）；非 null=该值已确认送达。
+    /** 最近一次成功推到眼镜端的「连续对话」开关值 */
+    @Volatile
+    private var continueDialogSynced: Boolean? = null
+    /** 最近一次成功推到眼镜端的「按键答题」开关值 */
+    @Volatile
+    private var keyQuizSynced: Boolean? = null
+    /** 最近一次成功同步时对应的眼镜端进程启动标记（HELLO 第 4 字段；null=旧版眼镜端未上报） */
+    @Volatile
+    private var syncedServiceStartAt: Long? = null
+    /** 补推进行中标志：HELLO 可能连来多条（探针应答），避免并发重复推 */
+    @Volatile
+    private var switchSyncInFlight = false
+    /** 「拍照问 AI」图片回调超时兜底（takePhoto 成功但图片回调永不到达时复位状态） */
+    /** 使用同步锁保护操作状态 */
+    internal val operationLock = Any()
+
+    /**
+     * AI 单条指令发送互斥锁：sendAiTextViaLink 全流程锁（aiSendLock）持有期间，
+     * 工具进度线程（deepSeekThread）会并发向眼镜发送进度提示（TTS_Result），
+     * 与下行主链路的 KeyDown/open/ASR_Result/ASR_End 存在并发 sendCustomCmd 竞态。
+     * 下行主链路各条指令与进度发送均按条加锁串行。
+     *
+     * 锁顺序约定：aiSendLock（外层）→ aiCmdLock（内层），全程单向获取，
+     * 禁止反向（持有 aiCmdLock 时再去获取 aiSendLock）以防死锁。
+     * 当前所有 aiCmdLock 临界区均在 aiSendLock 持有期间调用，顺序一致，无死锁风险。
+     */
+    internal val aiCmdLock = Any()
+
+    /**
+     * 眼镜 AI 助手场景（ai_assist）开关状态。
+     *
+     * 来源：眼镜打开/关闭场景时上行 Ai_SceneStatus，CXR-L SDK 经
+     * ICXRLinkCbk.onGlassAiAssistStart/Stop 回调到本类（接线见 ConnectionService）。
+     *
+     * 用途（2026-09-19 双端抓包实测）：冷启动时眼镜收到 KeyDown_Client 后约 502ms
+     * 才自开场景；ASR_Result 若早于场景打开到达，AsrMessageHandler 虽执行但没有会话
+     * item 可写，随后 AIOpenHandler 的 clearData 又清空状态 → 提问文字丢失（只弹空
+     * AI 助手）。故手机端发 KeyDown 后必须等场景真正打开（本状态翻 true）再下发
+     * ASR_Result/ASR_End。
+     *
+     * 注意：App 进程刚启动时该状态未知（默认 false），场景即使本就打开也不会补通知，
+     * 这种情况下首轮消息走超时兜底（见 [waitAiSceneOpen]），收到首次状态变更后即准确。
+     */
+    @Volatile
+    private var aiSceneOpen = false
+    private val aiSceneLock = java.util.concurrent.locks.ReentrantLock()
+    private val aiSceneCondition = aiSceneLock.newCondition()
+
+    /** CXR-L 回调：眼镜 AI 助手场景打开/关闭（回调可能在 binder 线程） */
+    internal fun setAiSceneOpen(open: Boolean) {
+        aiSceneLock.withLock {
+            if (aiSceneOpen != open) {
+                aiSceneOpen = open
+                aiSceneCondition.signalAll()
+            }
+        }
+    }
+
+    /**
+     * 阻塞等待眼镜 AI 场景打开（供 KeyDown 后的下行链路在后台线程调用）。
+     * @return true=收到场景打开通知；false=超时（调用方按兜底节奏继续即可）
+     */
+    internal fun waitAiSceneOpen(timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        aiSceneLock.withLock {
+            while (!aiSceneOpen) {
+                val remain = deadline - System.currentTimeMillis()
+                if (remain <= 0) return false
+                try {
+                    aiSceneCondition.await(remain, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    /**
+     * 环境音监听协调器（双模式：工具一次性听一段 / 顶栏耳朵按钮持续录入，必须在 asrBridge 之前初始化）。
+     * onFinalSentence 用 lambda 捕获 aiConversation —— 延迟执行，无初始化顺序问题。
+     */
+    internal val ambientListen = AmbientListenCoordinator(
+        appScope = appScope,
+        linkProvider = { cxrLink },
+        linkAlive = { cxrlConnected },
+        cmdLock = aiCmdLock,
+        onFinalSentence = { text -> aiConversation.dispatchGlassesAsrText(text, fromAmbient = true) },
+    )
+
+    /** ASR 桥接协调器（双通道接收/去重/控制标记/下行 ping，从本类拆出，职责见其文档） */
+    internal val asrBridge = AsrBridgeCoordinator(
+        appContext = appContext,
+        appScope = appScope,
+        linkProvider = { cxrLink },
+        linkAlive = { cxrlConnected },
+        cmdLock = aiCmdLock,
+        asrDeliver = { text -> dispatchGlassesAsrText(text) },
+        // ⚠️ 不要在这里再显式 stopTtsOnGlass()：abortCurrentAi() 内部必发一次 tts_stop
+        //（AiConversationService.abortCurrentAi → session.stopTtsOnGlass()），
+        // 重复下发只会让同一事件产生两条帧（且第二条与下行序列争 aiCmdLock）。
+        onAbortAi = {
+            abortCurrentAi()
+        },
+        onPhotoAsk = { startPhotoAsk() },
+        onToolCall = { payload -> handleAiuiToolCall(payload) },
+        // 连续对话续听：眼镜端 Lab 回复 TTS 播完 → 手机端下发 TTS_AudioFinished，
+        // 触发官方 AudioFinishedHandler → startNewTalk 重开拾音（必须在手机侧发，见常量注释）。
+        onContinueDialog = { requestGlassesContinueDialog() },
+        // 环境音转写：眼镜端官方字幕链路结果 → AmbientListenCoordinator 收集
+        onAmbientText = { json -> ambientListen.onAmbientFrame(json) },
+        // 环境音回复播完：眼镜端 Lab 回复 TTS 真正播完时上行，静默定时对表回 10s
+        onAmbientTtsDone = { ambientListen.onAiRoundDone() },
+        // 兜底轮询复用全 App 共享 ADB 会话：自建会话会挤断用户正在用的 ADB 工具/投屏会话。
+        // 长连接（屏幕镜像/手机投屏/文件浏览）占用隧道时让路 —— 返回 null 触发退避，
+        // 避免这条「兜底」通道反而把用户正在用的长连接挤断。
+        adbClientProvider = {
+            val rm = (appContext as LabApplication).routeManager
+            // 长连接（屏幕镜像/手机投屏/文件浏览）占用蓝牙通道时，BACKGROUND 兜底轮询
+            // 按优先级让路 —— 避免这条「兜底」通道反而把用户正在用的长连接挤断。
+            if (rm.channelArbiter.shouldYield(ChannelPriority.BACKGROUND)) null else getAdbShellClient()
+        },
+    )
+
+    /**
+     * AIUI 页面发起的工具调用（上行 __LAB_TOOL__ + JSON）。
+     *
+     * 页面 → 眼镜端 JS bridge → RFCOMM 上行 → 本方法 → ToolGateway 执行 →
+     * 结果经 CMD_AIUI_MSG 下行 → 眼镜端 dispatchMessageToActive → 页面 Promise resolve。
+     *
+     * 已在 AsrBridgeCoordinator 侧切到后台线程，此处可直接同步执行。
+     */
+    private fun handleAiuiToolCall(payload: String) {
+        var cbId = ""
+        try {
+            val obj = JSONObject(payload)
+            cbId = obj.optString("cbId")
+            val name = obj.optString("name")
+            val args = obj.optString("args").ifBlank { "{}" }
+            Log.i(TAG, "handleAiuiToolCall: name=$name cbId=$cbId")
+            // 带上 cbId：页面超时重试会带同一个 cbId 回来，
+            // 网关据此幂等去重，避免重复拨号/重复安装这类真实副作用。
+            val r = com.rokidlab.phone.ai.ToolGateway.call(appContext, name, args, cbId)
+            val out = JSONObject()
+                .put("type", "toolResult")
+                .put("cbId", cbId)
+                .put("ok", r.ok)
+            r.result?.let { out.put("result", it) }
+            r.error?.let { out.put("error", it) }
+            // 物理上限证据（R13）：RFCOMM 单帧 64KB，超过它若被传输层静默截断，
+            // 页面会拿到非法 JSON 且无真因可查。网关侧已有 per-tool 40K / 通用 8K 双闸，
+            // 走到这里还超限只可能是闸被绕过/新增大结果工具未登记 —— 留下真因并改发短错误。
+            if (out.toString().length > DOWNLINK_HARD_LIMIT_CHARS) {
+                LogCollector.e(
+                    TAG,
+                    "AIUI 工具结果 ${out.toString().length} 字符超过下行硬上限 $DOWNLINK_HARD_LIMIT_CHARS" +
+                        "（name=$name cbId=$cbId）：改发短错误，请检查该工具是否漏登记结果上限",
+                )
+                val slim = JSONObject()
+                    .put("type", "toolResult")
+                    .put("cbId", cbId)
+                    .put("ok", false)
+                    .put("error", "tool '$name' produced an oversized result; downlink refused")
+                val slimSent = aiuiHost.sendAiuiHostMessage(slim.toString())
+                if (slimSent != 0) {
+                    LogCollector.w(TAG, "AIUI 短错误下行也失败 ret=$slimSent cbId=$cbId")
+                }
+                return
+            }
+            // 下行返回值必须检查：sendAiuiHostMessage 走 CXR 通道，链路断开时返回 -2/-1，
+            // 原先丢弃返回值会让「工具已执行但结果发不出去」完全无声（页面侧零报错，
+            // 排查时也看不到任何失败记录）。
+            val sent = aiuiHost.sendAiuiHostMessage(out.toString())
+            if (sent != 0) {
+                // 双写日志：只 Log.w 在 logcat 里，App 内日志面板（LogCollector）看不到 ——
+                // 排查「页面 pending 永挂」时这里是无声的（闭环审计 R8）。
+                LogCollector.w(TAG, "AIUI 工具结果下行失败 ret=$sent name=$name cbId=$cbId（页面 pending 将永挂）")
+                Log.w(TAG, "handleAiuiToolCall: result send failed (ret=$sent) name=$name cbId=$cbId")
+                // ⚠️ 页面桥**没有超时机制**：ink 沙箱不跑定时器，pending[cbId] 只能靠
+                // onHostMessage → finish 解除（lab-page-bridge.js 文件头钉死别改回去）。
+                // 结果帧发不出去 ⇒ 页面回调永远不 firing：loading 永转、pending 条目
+                // 累积、零用户可见报错 —— 链路抖一次页面就静默死亡（2026-10-18 M1）。
+                // 尽力补发一条短错误帧：链路真断时它同样送不出去（如实再记一条），
+                // 但瞬断 / 大帧被传输层拒的场景下，它是页面唯一的解脱路径。
+                runCatching {
+                    val slim = JSONObject()
+                        .put("type", "toolResult")
+                        .put("cbId", cbId)
+                        .put("ok", false)
+                        .put("error", "tool '$name' result downlink failed (ret=$sent)")
+                    val slimRet = aiuiHost.sendAiuiHostMessage(slim.toString())
+                    if (slimRet != 0) {
+                        LogCollector.w(
+                            TAG,
+                            "AIUI 错误兜底下行也失败 ret=$slimRet name=$name cbId=$cbId" +
+                                "（页面 pending 将永挂，只能等页面重载或链路恢复）",
+                        )
+                        Log.w(TAG, "handleAiuiToolCall: slim error send failed (ret=$slimRet) cbId=$cbId")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "handleAiuiToolCall failed", e)
+            // 解析/下发失败也要尽力回传，否则页面 Promise 会挂到超时
+            runCatching {
+                val ret = aiuiHost.sendAiuiHostMessage(
+                    JSONObject()
+                        .put("type", "toolResult")
+                        .put("cbId", cbId)
+                        .put("ok", false)
+                        .put("error", "tool call failed: ${e.message}")
+                        .toString(),
+                )
+                if (ret != 0) {
+                    LogCollector.w(TAG, "AIUI 工具错误下行失败 ret=$ret cbId=$cbId（页面将等到超时）")
+                    Log.w(TAG, "handleAiuiToolCall: error send failed (ret=$ret) cbId=$cbId")
+                }
+            }
+        }
+    }
+
+    /**
+     * 手机端 NetProxy 应答器：眼镜端 Jsai 下载 .aix（installAiuiAgent）时，
+     * 眼镜经 BLE 代理把 HTTP 流量发到手机，本中继在手机侧执行真实 socket 收发后
+     * 以 Proxy_NetResponse 应答（协议详见 GlassProxyRelay）。
+     */
+    private val proxyRelay: GlassProxyRelay = GlassProxyRelay(::sendProxyFrame)
+
+    /** 「拍照问 AI」域服务（Phase 3 三轮：PhotoQuizFlow 编排 + 拍照链路迁至 domain/PhotoQuizService） */
+    internal val photoQuizService = com.rokidlab.phone.domain.PhotoQuizService(this)
+
+    /** 注册「拍照问 AI」流程的 UI 回调（乐奇聊天界面进入时调用，按键触发时复用展示） */
+    fun setPhotoAskUiCallbacks(
+        onStage: (Int) -> Unit,
+        onText: (String) -> Unit,
+        onReply: (String) -> Unit,
+        onStageText: (String) -> Unit = {},
+    ) = photoQuizService.setPhotoAskUiCallbacks(onStage, onText, onReply, onStageText)
+
+    /** 还原「拍照问 AI」的 App 级默认回调（乐奇聊天界面离开时调用，见 PhotoQuizService） */
+    fun resetPhotoAskUiCallbacks() = photoQuizService.resetPhotoAskUiCallbacks()
+
+
+    /**
+     * appStart 后的一次性冷却标志：真实 resume（appStart 触发的 Sys_App_Resume_Change）只会到达一次，
+     * 用一次性标志消费而非 3s 时间窗口——时间窗口会把「开启后 3s 内的第一次按键」也误过滤，
+     * 导致按键答题开启后第一次按键没反应。标志设置后 3s 未收到真实 resume 会自动清除（防残留）。
+     */
+    @Volatile
+    internal var quizResumeCooling = false
+
+    /** WiFi 连接状态回调（由 sendWifiConfig 设置，统一在全局指令监听中转发） */
+    @Volatile
+    internal var wifiStatusCallback: ((String) -> Unit)? = null
+
+    // ═══════════════════════════════════════════════════
+    // AI 配置域（Phase 3：委派到 L3 domain/AiConfigService，门面签名不变）
+    // ═══════════════════════════════════════════════════
+
+    internal val aiConfig = com.rokidlab.phone.domain.AiConfigService(this)
+
+    fun setDeepSeekApiKey(key: String) = aiConfig.setDeepSeekApiKey(key)
+    fun setAiConfig(config: AiConfig) = aiConfig.setAiConfig(config)
+    fun isLocalChatActive(): Boolean = aiConfig.isLocalChatActive()
+    fun localChatModel(): String = aiConfig.localChatModel()
+    fun localChatParams(): String = aiConfig.localChatParams()
+    fun setLocalChatParams(json: String) = aiConfig.setLocalChatParams(json)
+    fun getOnlineAiConfig(): AiConfig = aiConfig.getOnlineAiConfig()
+    fun setLocalChatModel(modelName: String) = aiConfig.setLocalChatModel(modelName)
+    fun setQuizInstructionOnly(text: String) = aiConfig.setQuizInstructionOnly(text)
+    fun backfillOnlineApiKey(key: String) = aiConfig.backfillOnlineApiKey(key)
+    fun isThinkingEnabled(): Boolean = aiConfig.isThinkingEnabled()
+    fun setThinkingEnabled(enabled: Boolean) = aiConfig.setThinkingEnabled(enabled)
+    fun getAiConfig(): AiConfig = aiConfig.getAiConfig()
+
+    // ═══════════════════════════════════════════════════
+    // Phase 3 · L3 domain 服务装配（Connection / DeviceControl / AiConversation）
+    // 门面签名不变、调用方零改动；实现见 domain/ 对应服务
+    // ═══════════════════════════════════════════════════
+
+    internal val connection = com.rokidlab.phone.domain.ConnectionService(this)
+    internal val deviceControl = com.rokidlab.phone.domain.DeviceControlService(this)
+    internal val aiConversation = com.rokidlab.phone.domain.AiConversationService(this)
+
+    /** L4 工具确认通道（Phase 4：副作用工具的眼镜端用户确认，注入 ApprovalGate） */
+    /** Phase 4：副作用工具确认通道 —— 用全局常驻单例（会话重建/清理都不会让通道消失） */
+    internal val toolConfirm = com.rokidlab.phone.ai.GlassToolConfirmChannel.global
+
+    // —— 设备控制域（domain/DeviceControlService）——
+    fun sendTtsToGlass(text: String): Int = deviceControl.sendTtsToGlass(text)
+    fun stopTtsOnGlass(): Int = deviceControl.stopTtsOnGlass()
+    fun stopPhoneMirrorOnGlasses(): Int = deviceControl.stopPhoneMirrorOnGlasses()
+    fun installApk(apkFile: File, onInstallResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.installApk(apkFile, onInstallResult)
+    fun installApk(apkFile: File, packageName: String, onInstallResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.installApk(apkFile, packageName, onInstallResult)
+    fun launchApp(packageName: String, activityClass: String = ".MainActivity", sendCmdAfterLaunch: String? = null, onLaunchResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.launchApp(packageName, activityClass, sendCmdAfterLaunch, onLaunchResult)
+    fun sendKeyButtonConfig(shortPkg: String, shortActivity: String, longPkg: String, longActivity: String, onResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.sendKeyButtonConfig(shortPkg, shortActivity, longPkg, longActivity, onResult)
+    fun sendWifiConfig(ssid: String, password: String, onResult: ((Boolean, String?) -> Unit)? = null) =
+        deviceControl.sendWifiConfig(ssid, password, onResult)
+    fun sendKeyQuizConfig(enabled: Boolean, onResult: ((Boolean) -> Unit)? = null) {
+        deviceControl.sendKeyQuizConfig(enabled, onResult = { ok ->
+            // 同步水位：送达才记值；失败置 null（脏）⇒ 下次 HELLO 补推
+            keyQuizSynced = if (ok) enabled else null
+            onResult?.invoke(ok)
+        })
+    }
+    /** 下发「连续对话」开关到眼镜端。手机端本地持久化放在这里（而不是只在 DeviceControlService）：
+     *  眼镜不在线 / 前置条件不满足时，用户的选择同样要记住，下次设置页打开能读回。 */
+    fun sendContinueDialogConfig(enabled: Boolean, onResult: ((Boolean) -> Unit)? = null) {
+        runCatching {
+            appContext.getSharedPreferences(AI_PREFS, 0).edit()
+                .putBoolean(KEY_KEY_CONTINUE_DIALOG, enabled)
+                .apply()
+        }
+        deviceControl.sendContinueDialogConfig(enabled, onResult = { ok ->
+            // 同步水位：送达才记值；失败置 null（脏）⇒ 下次 HELLO 补推
+            continueDialogSynced = if (ok) enabled else null
+            onResult?.invoke(ok)
+        })
+    }
+
+    /**
+     * 行为类开关补推：把手机端 prefs 里的开关真值推到眼镜端执行器。
+     *
+     * **为什么需要**：眼镜端 RokidLink 重装（引导/设置页「先卸后装」）会清掉它的
+     * SharedPreferences，`chat_continue_dialog` 回落默认 **true** —— 手机端开关显示
+     * "关"、眼镜端却继续多轮免唤醒（2026-10-24 用户实测）。此外点击时那一次下发
+     * 若失败（链路半开 / cxr-service 分发路由 stale）也无人补刀。
+     * 本方法在两种时机被触发：眼镜端进程换代（HELLO 第 4 字段变化）、开关值变脏。
+     *
+     * 走**轻量通道**（allowFullReconnect=false）：只复用现有链路直发，失败就留给
+     * 下一次 HELLO（探针 60s 一轮）重试 —— 后台同步绝不可以拆掉在途会话。
+     */
+    /**
+     * 等一次开关下发的回执。DeviceControlService 的 sendXxxConfig 都是「异步 deliver」式
+     * （返回 Unit，结果只从 onResult 回调出来），这里用 latch 同步等：
+     * 复用链路路径在调用线程内同步回执（latch 提前放开，await 立即返回）；
+     * 全链路重建路径回执在 SDK 回调线程。超时（兜底）按失败处理——水位保持脏，留给下次 HELLO。
+     */
+    private fun awaitSwitchDeliver(send: ((Boolean) -> Unit) -> Unit): Boolean {
+        val latch = CountDownLatch(1)
+        var result = false
+        send { ok ->
+            result = ok
+            latch.countDown()
+        }
+        latch.await(SWITCH_SYNC_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        return result
+    }
+
+    private fun syncBehaviorSwitchesToGlasses(serviceStartAt: Long?) {
+        if (switchSyncInFlight) return
+        val epochChanged = serviceStartAt != null && syncedServiceStartAt != serviceStartAt
+        val contDirty = continueDialogSynced != isContinueDialogEnabled()
+        val quizDirty = keyQuizSynced != isKeyQuizEnabled()
+        if (!epochChanged && !contDirty && !quizDirty) return
+        switchSyncInFlight = true
+        appScope.launch(Dispatchers.IO) {
+            try {
+                // 在协程内、发送前一刻重读真值：缩小「用户刚点过开关」与本次补推的竞态窗口
+                val cont = isContinueDialogEnabled()
+                val quiz = isKeyQuizEnabled()
+                val epochChangedNow = serviceStartAt != null && syncedServiceStartAt != serviceStartAt
+                if (epochChangedNow || continueDialogSynced != cont) {
+                    val ok = awaitSwitchDeliver {
+                        deviceControl.sendContinueDialogConfig(cont, allowFullReconnect = false, onResult = it)
+                    }
+                    if (ok) continueDialogSynced = cont
+                    Log.i(TAG, "switch sync: continue dialog -> $cont (ok=$ok, epochChanged=$epochChangedNow)")
+                }
+                if (epochChangedNow || keyQuizSynced != quiz) {
+                    val ok = awaitSwitchDeliver {
+                        deviceControl.sendKeyQuizConfig(quiz, allowFullReconnect = false, onResult = it)
+                    }
+                    if (ok) keyQuizSynced = quiz
+                    Log.i(TAG, "switch sync: key quiz -> $quiz (ok=$ok, epochChanged=$epochChangedNow)")
+                }
+                // 两个都送达才认下这个世代；任一失败则留着，下次 HELLO 重推
+                if (epochChangedNow && continueDialogSynced == cont && keyQuizSynced == quiz) {
+                    syncedServiceStartAt = serviceStartAt
+                }
+            } finally {
+                switchSyncInFlight = false
+            }
+        }
+    }
+    fun stopApp(packageName: String, onStopResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.stopApp(packageName, onStopResult)
+    fun uninstallApp(packageName: String, onUninstallResult: ((Boolean) -> Unit)? = null) =
+        deviceControl.uninstallApp(packageName, onUninstallResult)
+    /** 查询安装状态；onResult 的 Boolean? 为三态：true/false 为眼镜端真实回执，null 表示查询失败（状态未知） */
+    fun queryInstalledApps(packageNames: List<String>, onResult: (String, Boolean?) -> Unit, onComplete: () -> Unit) =
+        deviceControl.queryInstalledApps(packageNames, onResult, onComplete)
+
+    // —— AI 对话域（domain/AiConversationService）——
+    fun sendAiTextMessage(
+        text: String,
+        onResult: ((Boolean, String?) -> Unit)? = null,
+        onReply: ((String) -> Unit)? = null,
+        contextText: String? = null,
+        interruptOfficialFirst: Boolean = false,
+        skipTtsAudioFinished: Boolean = false,
+        showAsrResult: Boolean = true,
+        localTakeover: Boolean = false,
+        instruction: String? = null,
+        recordHistory: Boolean = true,
+        onDelta: ((String) -> Unit)? = null,
+        readOnlyTools: Boolean = false,
+        /** Agent 过程回调（思考 / 工具调用），供手机端聊天窗口的「过程」时间线 */
+        onTrace: ((com.rokidlab.phone.ai.AgentStep) -> Unit)? = null,
+        /** 多模态图像（base64，不含 `data:` 前缀），见 [com.rokidlab.phone.domain.AiConversationService.sendAiTextMessage] */
+        imageBase64: String? = null,
+        /** 本会话的附加提示词（null = 没设），语义见 [com.rokidlab.phone.domain.AiConversationService.sendAiTextMessage] */
+        sessionPrompt: String? = null,
+        /** 代际回调（抢占代际号分配后同步回调），语义见 [com.rokidlab.phone.domain.AiConversationService.sendAiTextMessage] */
+        onGeneration: ((Long) -> Unit)? = null,
+        /** 忙时顺延（后台到达专用），语义见 [com.rokidlab.phone.domain.AiConversationService.sendAiTextMessage] */
+        queueIfBusy: Boolean = false,
+    ) = aiConversation.sendAiTextMessage(text, onResult, onReply, contextText, interruptOfficialFirst, skipTtsAudioFinished, showAsrResult, localTakeover, instruction, recordHistory, onDelta, onTrace, readOnlyTools, imageBase64, sessionPrompt, onGeneration, queueIfBusy)
+
+    fun abortCurrentAi() = aiConversation.abortCurrentAi()
+
+    /** 只停播报、不作废在途生成（眼镜 AI 场景退出时调用），语义见 AiConversationService.stopSpeak */
+    fun stopSpeak() = aiConversation.stopSpeak()
+
+    /** 当前 AI 代际（拍照答题回退 OCR 前的"我是否还是最新请求"判据） */
+    fun currentAiGeneration(): Long = aiConversation.currentAiGeneration()
+
+    /** 是否有生成正在进行（拍照答题入口互斥：两轮并发会共用同一个过程锚点） */
+    fun isAiBusy(): Boolean = aiConversation.isAiBusy()
+
+    /**
+     * 连续对话续听：眼镜端 Lab 回复 TTS 播完后推标记上来，由本方法经 CXR `Ai` 频道
+     * 下发 `TTS_AudioFinished`，触发官方 `AudioFinishedHandler → startNewTalk` 重开拾音。
+     *
+     * 必须是手机侧下发：该帧只有**入站**（手机→眼镜）才被官方分发器处理，
+     * 眼镜端本机 `sendAi` 是出站帧、官方收不到（真机 trace 实测）。
+     */
+    fun requestGlassesContinueDialog(): Boolean = aiConversation.requestGlassesContinueDialog()
+
+    /** 注册眼镜端语音对话的 UI 回调（乐奇聊天界面进入时调用） */
+    fun setGlassesAiUiCallbacks(onText: (String) -> Unit, onReply: (String) -> Unit) =
+        aiConversation.setGlassesAiUiCallbacks(onText, onReply)
+
+    /**
+     * 注册「过程」（思考 / 工具调用）全局汇聚点（App 启动时调用一次，见 `LabApplication.setCxrL`）。
+     *
+     * 注册在 App 层而非聊天界面：AI 入口有 4 条（打字 / 眼镜语音 / 拍照答题 / 定时任务），
+     * 逐条传参漏一条就没有过程显示（实测漏掉眼镜语音）；App 级汇聚点天然全覆盖。
+     */
+    fun setAgentTraceSink(
+        onStep: ((com.rokidlab.phone.ai.AgentStep) -> Unit)?,
+        onFinish: ((Boolean) -> Unit)? = null,
+    ) = aiConversation.setAgentTraceSink(onStep, onFinish)
+
+    /** ASR 文字分发（Phase 3：委派到 L3 AiConversationService，AsrBridgeCoordinator 装配点零改动） */
+    private fun dispatchGlassesAsrText(text: String) = aiConversation.dispatchGlassesAsrText(text)
+
+
+    // ═══════════════════════════════════════════════════
+    // AI 工具：ADB 查询客户端（Phase 2 收尾：所有权移交 L0 platform/AdbTransport）
+    // ═══════════════════════════════════════════════════
+
+    /**
+     * 全 App 共享 ADB 会话的唯一所有者（L0 边界，见 [com.rokidlab.phone.platform.AdbTransport]）。
+     *
+     * 端点由当前路由解析：WiFi 直连优先，失败回落蓝牙隧道（[ConnectionRoute]）。
+     * 建链失败时清线路缓存，下次强制重新探测。
+     */
+    private val adbTransport = com.rokidlab.phone.platform.AdbTransport(
+        contextProvider = { appContext },
+        endpointProvider = {
+            runCatching {
+                val app = appContext as LabApplication
+                val route = runBlocking { app.routeManager.resolve(app.glassesIp, 5555) }
+                when (route) {
+                    is ConnectionRoute.Wifi -> com.rokidlab.phone.platform.AdbEndpoint(route.ip, route.port)
+                    is ConnectionRoute.Bluetooth ->
+                        com.rokidlab.phone.platform.AdbEndpoint(route.ip, route.localPort, viaBluetooth = true)
+                    is ConnectionRoute.None -> null
+                }
+            }.getOrNull()
+        },
+        onRouteFailure = {
+            runCatching { (appContext as LabApplication).routeManager.clearRouteCache() }
+        },
+        // 后台线路升级：只读探测 WiFi 直连是否就绪，就绪则把共享会话从蓝牙隧道拆掉重建成 WiFi。
+        // 只探 adbd(5555)，不调 resolve() —— resolve 会顺带建蓝牙隧道，与此处「只判可达」的语义不符。
+        preferredEndpointProvider = {
+            runCatching {
+                val app = appContext as LabApplication
+                val ip = app.glassesIp
+                if (ip.isNotBlank() && app.routeManager.isWifiReachable(ip)) {
+                    com.rokidlab.phone.platform.AdbEndpoint(ip, 5555)
+                } else null
+            }.getOrNull()
+        },
+        // WiFi 端点建链失败 → 记账（清缓存 + 记录断线信号），使下一次 resolve 优先落到蓝牙隧道
+        onWifiFailure = {
+            runCatching { (appContext as LabApplication).routeManager.noteWifiFailure() }
+        },
+    )
+
+
+
+
+
+
+    /** L3 AIUI 宿主服务（Phase 3：AiuiFrontendController 装配 + 12 个委派收口到 domain/） */
+    internal val aiuiHost = com.rokidlab.phone.domain.AiuiHostService(this)
+
+    /** 在眼镜上打开一个 AIUI agent（.aix），协议与参数见 AiuiFrontendController */
+    fun openAiuiAgent(
+        agentId: String,
+        agentName: String,
+        nativeVersion: String = "0.0.74",
+        pageName: String = "pages/index/index",
+    ): Int = aiuiHost.openAiuiAgent(agentId, agentName, nativeVersion, pageName)
+
+    /** 直启眼镜 cxr 目录已存在的 .aix（Sys_AIUI_Start） */
+    fun startAiuiPackage(packageName: String): Int = aiuiHost.startAiuiPackage(packageName)
+
+    /** 关闭眼镜上正在渲染的 .aix（Sys_AIUI_Stop） */
+    fun stopAiuiPackage(packageName: String): Int = aiuiHost.stopAiuiPackage(packageName)
+
+    /** 打开自托管宿主渲染本地已推送的 .aix */
+    fun openAiuiHost(fileName: String? = null): Int = aiuiHost.openAiuiHost(fileName)
+
+    /** 关闭正在渲染的宿主 */
+    fun closeAiuiHost(): Int = aiuiHost.closeAiuiHost()
+
+    /** 以 onMessage 协议向宿主页面注入消息 */
+    fun sendAiuiHostMessage(json: String): Int = aiuiHost.sendAiuiHostMessage(json)
+
+    /** 把本地 .aix 推到 RokidLink aiui_host 目录并自动拉起宿主渲染 */
+    fun pushAixToRokidLinkHost(
+        aixFile: File,
+        openAfter: Boolean = true,
+        launchParams: String? = null,
+    ): String? = aiuiHost.pushAixToRokidLinkHost(aixFile, openAfter, launchParams)
+
+    /**
+     * CXR-L 1.1.0 的 ExternalAppClient.sendCustomCmd 内置保留 cmd 黑名单
+     * （Dev/Med/Ota/Ai/Ntf/Nav/Sys/ARTC/Trans/Pay/Settings/Custom_View/Schedule/Memo），
+     * 命中即返回 -1，外部无法直发 "Sys"/"Ai"。SDK 内部封装（appStart/openApp 等）
+     * 同样绕过黑名单直接走 Binder 层 IMediaStreamService.sendCustomCmd(cmd, bytes)。
+     * 这里用反射取 ExternalAppClient 私有字段 b（IMediaStreamService）绕过黑名单直发。
+     */
+    internal fun rawSendCustomCmd(link: CXRLink, cmd: String, caps: Caps): Int {
+        return when (val r = CapabilityProbe.sdkBridge.rawSendCustomCmd(link, cmd, caps)) {
+            is Capability.Available -> r.value
+            is Capability.Unavailable -> {
+                Log.e(TAG, "rawSendCustomCmd($cmd) 失败: ${r.reason}")
+                -3
+            }
+        }
+    }
+
+    /** 安装 AIUI agent 到眼镜（Jsai_AddNativeAgent） */
+    fun installAiuiAgent(
+        agentId: String,
+        agentName: String,
+        url: String,
+        fileMd5: String,
+        nativeVersion: String = "0.0.74",
+        agentDesc: String = "",
+    ): Int = aiuiHost.installAiuiAgent(agentId, agentName, url, fileMd5, nativeVersion, agentDesc)
+
+    /** 直装 .aix 并自动打开一次 */
+    fun installAndOpenAiuiAgentOnce(
+        agentId: String,
+        agentName: String,
+        url: String,
+        fileMd5: String,
+        openDelayMs: Long = 3000L,
+        openRetryMs: Long = 2000L,
+        openTimeoutMs: Long = 25_000L,
+    ): Int = aiuiHost.installAndOpenAiuiAgentOnce(agentId, agentName, url, fileMd5, openDelayMs, openRetryMs, openTimeoutMs)
+
+    /** 向眼镜下发 native agent 目录地址（Jsai_GetRequestInfo） */
+    fun pushAiuiAgentListUrl(agentListUrl: String): Int = aiuiHost.pushAiuiAgentListUrl(agentListUrl)
+
+    /** 在时间窗口内周期下发目录配置 */
+    fun startAgentListPushWindow(
+        catalogUrl: String,
+        durationMs: Long = 60_000L,
+        intervalMs: Long = 1_500L,
+    ) = aiuiHost.startAgentListPushWindow(catalogUrl, durationMs, intervalMs)
+
+    fun stopAgentListPushWindow() = aiuiHost.stopAgentListPushWindow()
+
+    /** 通知眼镜立即重新拉取 native agent 目录（Jsai_NotifyGlassGetList） */
+    fun notifyGlassGetAgentList(): Int = aiuiHost.notifyGlassGetAgentList()
+
+    /**
+     * 向眼镜发送 NetProxy 应答帧（cmd="Proxy"，caps0=Proxy_NetResponse），
+     * 供 [GlassProxyRelay] 下行使用。与 AI 主链路同一把 aiCmdLock 串行。
+     */
+    private fun sendProxyFrame(caps: Caps): Int {
+        val link = cxrLink ?: return -2
+        return try {
+            synchronized(aiCmdLock) { link.sendCustomCmd("Proxy", caps) } ?: -3
+        } catch (e: Exception) {
+            Log.e(TAG, "sendProxyFrame failed", e)
+            -1
+        }
+    }
+
+    /**
+     * 获取（或懒创建并连接）ADB shell 客户端 —— 全 App 唯一的 ADB 会话入口。
+     * 必须在后台线程调用（同步阻塞连接握手）。连接失败返回 null。
+     *
+     * ⚠️ 所有需要 ADB 会话的消费者（AI 工具 / ADB 工具页 / ASR 兜底轮询 / 定时任务）
+     * 都必须走这里复用同一份会话，**不得各自新建**：
+     * 手机侧蓝牙栈对「同一设备 + 同一 SCN」只允许一条客户端 RFCOMM 通道，
+     * 自建的第二条会话会把正在服务的那条挤断（表现为"用着用着突然不行了"）。
+     *
+     * 连接复用/重建、端点解析与串行化锁由 L0 [com.rokidlab.phone.platform.AdbTransport] 负责
+     * （`AdbTransport` 内部 `@Synchronized`：多个后台消费者并发来取时不加锁会并发建链、触发通道争抢）。
+     *
+     * 优先级让路由 L1 [com.rokidlab.phone.connection.ChannelArbiter] 负责：本方法是常规消费者
+     * （AI 工具 / ADB 工具页 / 定时任务 / AIUI 工具）的 NORMAL 档位出口，存在 LONG_LIVED
+     * 持有者（屏幕镜像 / 手机投屏 / 文件浏览）时返回 null 让路 —— 此时共享会话已被
+     * [releaseAdbShellClient] 主动断开，再尝试建链不仅会被蓝牙栈拒绝，还可能把用户正在
+     * 使用的长连接挤断。NORMAL 消费者之间共享同一条会话，互不让路。
+     */
+    fun getAdbShellClient(): com.rokidlab.phone.adb.AdbShellClient? {
+        val arbiter = (appContext as? LabApplication)?.container?.arbiter
+        if (arbiter != null && arbiter.shouldYield(ChannelPriority.NORMAL)) {
+            Log.i(TAG, "getAdbShellClient: yield to higher-priority holder ${arbiter.snapshot()}")
+            return null
+        }
+        val client = adbTransport.get() ?: return null
+        // ADB 通道一旦可用，就把眼镜端的「后台启动豁免」补上（见 ensureGlassesBackgroundLaunchAllowed）。
+        // 放在这里是因为它是全 App 唯一的 ADB 会话出口，且调用方都在后台线程。
+        ensureGlassesBackgroundLaunchAllowed(client)
+        return client
+    }
+
+    /** 本次会话是否已确认眼镜端拿到 BAL 豁免（避免每次取 client 都跑 appops） */
+    @Volatile
+    private var glassesBalExemptConfirmed = false
+
+    /** 本次会话是否已给眼镜端下发过 get_usage_stats（独立 gate，见下方下发处注释） */
+    @Volatile
+    private var glassesUsageStatsIssued = false
+
+    /**
+     * 授予并**复核**眼镜端 `SYSTEM_ALERT_WINDOW`（Android 12+ 后台启动限制 BAL 豁免）。
+     *
+     * 背景：RokidLink 是常驻前台服务，它 `startActivity` 拉起 `AiuiLinkActivity`（AIUI 宿主）/
+     * `PhoneMirrorActivity`（投屏）时会被系统以
+     * `Background activity start ... allowBackgroundActivityStart: false` **静默拒绝** ——
+     * 用户侧表现为「生成 AIUI 界面提示眼镜没权限 / 点了没反应」。
+     * 唯一可靠的解法就是让 RokidLink 拿到该 appop（或改用 ADB 直启，见 AiuiFrontendController）。
+     * （RokidLink 不再持有任何常驻可见 Activity：透明保活层会抢占官方 Launcher 的顶层
+     * resumed 身份，导致眼镜官方触摸板/乐奇控制失灵。）
+     *
+     * ⚠️ 历史事故（2026-10-24 用户报「自定义图全部情况下都显示」根因）：
+     * usage-stats 下发原本放在 BAL 已授权的早退 return **之后** ⇒ 存量设备
+     * （BAL 早就 allow）永远拿不到 `get_usage_stats`，眼镜端助手页探测降级成
+     * 「对话即显示」且永不收起。⇒ 两个 appop 的 gate 必须互相独立，且下发先于早退。
+     */
+    internal fun ensureGlassesBackgroundLaunchAllowed(client: com.rokidlab.phone.adb.AdbShellClient) {
+        val pkg = "com.rokidlab.rokidlink"
+        // 「自定义图」要用 UsageStats 探测官方助手页是否在前台（眼镜端 AssistantPageWatcher）。
+        // 与 SYSTEM_ALERT_WINDOW 同为 appops 特殊权限，同一处下发；拿不到时眼镜端会
+        // 高声告警并降级为「对话活动触发」，所以失败只记日志不阻塞链路。
+        // 成功才置位（通道偶发失败时下次再试），且**先于下面的 BAL 早退**。
+        if (!glassesUsageStatsIssued) {
+            when (val u = com.rokidlab.phone.platform.ShellOps.grantUsageStats(client, pkg)) {
+                is com.rokidlab.phone.platform.Capability.Available -> {
+                    glassesUsageStatsIssued = true
+                    Log.i(TAG, "glasses usage-stats grant issued (自定义图助手页探测)")
+                }
+                is com.rokidlab.phone.platform.Capability.Unavailable ->
+                    Log.w(TAG, "grant glasses usage-stats failed (自定义图将降级为对话活动触发): ${u.reason}")
+            }
+        }
+        if (glassesBalExemptConfirmed) return
+        when (val cur = com.rokidlab.phone.platform.ShellOps.isSystemAlertWindowAllowed(client, pkg)) {
+            is com.rokidlab.phone.platform.Capability.Available ->
+                if (cur.value) {
+                    glassesBalExemptConfirmed = true
+                    Log.i(TAG, "glasses BAL exemption already granted (SYSTEM_ALERT_WINDOW=allow)")
+                    return
+                }
+            is com.rokidlab.phone.platform.Capability.Unavailable ->
+                Log.w(TAG, "query glasses SYSTEM_ALERT_WINDOW failed: ${cur.reason}")
+        }
+        when (val g = com.rokidlab.phone.platform.ShellOps.grantSystemAlertWindow(client, pkg)) {
+            is com.rokidlab.phone.platform.Capability.Available -> {
+                val verified = com.rokidlab.phone.platform.ShellOps.isSystemAlertWindowAllowed(client, pkg)
+                val ok = (verified as? com.rokidlab.phone.platform.Capability.Available)?.value == true
+                glassesBalExemptConfirmed = ok
+                if (ok) Log.i(TAG, "glasses BAL exemption granted+verified (SYSTEM_ALERT_WINDOW=allow)")
+                else Log.w(TAG, "glasses BAL exemption grant NOT verified: " +
+                    ((verified as? com.rokidlab.phone.platform.Capability.Unavailable)?.reason ?: "appops still not allow"))
+            }
+            is com.rokidlab.phone.platform.Capability.Unavailable ->
+                Log.w(TAG, "grant glasses BAL exemption failed: ${g.reason}")
+        }
+    }
+
+    /**
+     * 主动释放共享 ADB 会话（长连接消费者上场前调用）。
+     *
+     * 手机侧蓝牙栈对「同一设备 + 同一 SCN」只允许一条客户端 RFCOMM 通道：
+     * 屏幕镜像 / 手机投屏 / 文件浏览需要长时间独占隧道，若共享会话还占着通道，
+     * 它们的建链会被栈直接拒绝（表现为长连接「连接失败」）。
+     * 调用后共享会话立刻断开腾出通道；下次 [getAdbShellClient] 会自动重建，调用方无感知。
+     */
+    fun releaseAdbShellClient() = adbTransport.release()
+
+    /**
+     * 手机侧 WiFi 重新接入时通知共享 ADB 会话立刻重探首选（WiFi）线路。
+     *
+     * 见 [com.rokidlab.phone.platform.AdbTransport.onPreferredRouteMaybeAvailable]：
+     * 共享会话可能一直挂在蓝牙隧道上，不主动重探就要等满探测节流、且期间恰好有取用才会切换。
+     */
+    fun onWifiMaybeAvailable() = adbTransport.onPreferredRouteMaybeAvailable()
+
+    /** 当前「按键答题」开关状态（手机端本地持久化） */
+    fun isKeyQuizEnabled(): Boolean {
+        return runCatching {
+            appContext.getSharedPreferences(AI_PREFS, 0).getBoolean(KEY_KEY_QUIZ_ENABLED, false)
+        }.getOrDefault(false)
+    }
+
+    /** 当前「连续对话（多轮免唤醒）」开关状态（手机端本地持久化；实际执行方在眼镜端）。
+     *  默认开启：这是眼镜语音对话的默认体验（答完即可接着说），不需要的用户可在设置里关掉。 */
+    fun isContinueDialogEnabled(): Boolean {
+        return runCatching {
+            appContext.getSharedPreferences(AI_PREFS, 0).getBoolean(KEY_KEY_CONTINUE_DIALOG, true)
+        }.getOrDefault(true)
+    }
+
+    /** 清空 Agent 会话记忆（用户点击清空对话按钮时调用） */
+    fun clearAgentHistory() {
+        com.rokidlab.phone.ai.AgentSessionManager.clear()
+    }
+
+
+    private val authorizationService = com.rokidlab.phone.domain.AuthorizationService()
+
+    /**
+     * 补齐 SDK 内部权限列表（Phase 3：委派到 L3 [com.rokidlab.phone.domain.AuthorizationService]，
+     * 详见该类的 doc）。保留此方法是为了 init / selectHostApp / handleAuthorizationResult
+     * 三处调用点零改动迁移（Phase 3 门面委派策略）。
+     */
+    private fun grantGlassPermissions() {
+        authorizationService.grantGlassPermissions()
+    }
+
+    init {
+        // 从 SharedPreferences 恢复之前保存的授权令牌
+        runCatching {
+            val prefs = appContext.getSharedPreferences(PREFS_NAME, 0)
+            prefs.getString(tokenPrefKey(hostApp), null)?.takeIf { it.isNotBlank() }?.let {
+                token = it
+            }
+        }
+        // 已有 token 时补齐 SDK 内部权限列表，确保 takePhoto()/startAudioStream() 可用
+        if (!token.isNullOrBlank()) {
+            grantGlassPermissions()
+        }
+        // 初始化时通知连接状态（含授权状态），触发 checkRokidLinkInstallation() 等依赖连接状态的回调
+        notifyConnectionChanged()
+        // Phase 4：把常驻确认通道绑定到本会话，并（幂等地）注入 ApprovalGate 审批闸门
+        com.rokidlab.phone.ai.GlassToolConfirmChannel.bind(this)
+        com.rokidlab.phone.ai.approval.ApprovalGate.confirmationResolver = toolConfirm
+    }
+
+    fun hasAuthorization(): Boolean = !token.isNullOrBlank()
+    
+    fun getToken(): String? = token
+
+    fun ensureGlassesOperationReady(): Boolean {
+        return hasGlassesOperationPrerequisites(hostApp, requestAuthorizationIfMissing = true)
+    }
+
+    fun selectHostApp(nextHostApp: RokidHostApp) {
+        if (hostApp == nextHostApp) return
+        cleanup()
+        token = null
+        hostApp = nextHostApp
+        // 尝试加载新 hostApp 之前保存的令牌
+        runCatching {
+            val prefs = appContext.getSharedPreferences(PREFS_NAME, 0)
+            prefs.getString(tokenPrefKey(hostApp), null)?.takeIf { it.isNotBlank() }?.let {
+                token = it
+            }
+        }
+        // 切换 hostApp 后同样补齐权限列表
+        if (!token.isNullOrBlank()) {
+            grantGlassPermissions()
+        }
+        notifyConnectionChanged()
+    }
+
+    fun isHostAppInstalled(targetHostApp: RokidHostApp = hostApp): Boolean {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appContext.packageManager.getPackageInfo(targetHostApp.packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                appContext.packageManager.getPackageInfo(targetHostApp.packageName, 0)
+            }
+        }.isSuccess
+    }
+
+    /**
+     * 查询 Rokid AI App 的兼容状态（官方接入前置）。
+     *
+     * 以 SDK `checkRokidAppCompatibility` 返回为准，不写死版本串（阈值随 SDK 演进）；
+     * 检测异常返回 null，调用方按"放行"处理，避免 SDK 查询失败反而阻断正常授权。
+     */
+    private fun rokidAppStatus(targetHostApp: RokidHostApp): RokidAppStatus? {
+        return runCatching {
+            CxrSessionManager.getInstance(appContext).checkRokidAppCompatibility(appContext)
+        }.getOrNull()
+    }
+
+    fun requestAuthorization() {
+        val targetHostApp = hostApp
+        if (!isHostAppInstalled(targetHostApp)) {
+            onStatus(appContext.getString(R.string.install_glasses_host_first, targetHostApp.displayName))
+            return
+        }
+        // 官方接入前置：Rokid AI App 兼容版本（checkRokidAppCompatibility 阈值随 SDK 演进，
+        // 代码不写死版本串，以 SDK 返回为准）。版本过低时授权页/建链都会莫名失败，须先拦截提示。
+        if (rokidAppStatus(targetHostApp) is RokidAppStatus.VersionTooLow) {
+            onStatus(appContext.getString(R.string.auth_host_version_too_low, targetHostApp.displayName))
+            return
+        }
+
+        val launchIntent = runCatching {
+            Intent().setComponent(ComponentName(targetHostApp.packageName, AUTH_ACTIVITY_CLASS))
+        }.getOrElse {
+            Intent(AUTH_ACTION).setPackage(targetHostApp.packageName)
+        }
+        val launcher = authLauncher
+        if (launcher != null) {
+            launcher(launchIntent)
+            onStatus(appContext.getString(R.string.auth_page_opened, targetHostApp.displayName))
+        } else {
+            // 兜底：使用已废弃的 startActivityForResult（无现代 Launcher 时）；
+            // Activity 已被回收（弱引用失效）时无法跳授权页，仅提示
+            val currentActivity = activityRef.get()
+            if (currentActivity == null || currentActivity.isDestroyed || currentActivity.isFinishing) {
+                onStatus(appContext.getString(R.string.authorize_in_host, targetHostApp.displayName))
+                return
+            }
+            @Suppress("DEPRECATION")
+            currentActivity.startActivityForResult(launchIntent, 4027)
+            onStatus(appContext.getString(R.string.auth_page_opened, targetHostApp.displayName))
+        }
+    }
+
+    fun handleAuthorizationResult(resultCode: Int, data: Intent?) {
+        when (val result = AuthorizationHelper.parseAuthorizationResult(resultCode, data)) {
+            is AuthResult.AuthSuccess -> {
+                token = result.token
+                // 补齐 SDK 内部权限列表（绕过 requestAuthorization 直接授权导致 b 数组为空）
+                grantGlassPermissions()
+                // 持久化保存授权令牌，Activity 重建（如切换语言）后可恢复
+                runCatching {
+                    appContext.getSharedPreferences(PREFS_NAME, 0)
+                        .edit()
+                        .putString(tokenPrefKey(hostApp), result.token)
+                        .apply()
+                }
+                onStatus(appContext.getString(R.string.auth_token_obtained, hostApp.displayName))
+                notifyConnectionChanged()
+            }
+
+            is AuthResult.AuthCancel -> {
+                token = null
+                runCatching {
+                    appContext.getSharedPreferences(PREFS_NAME, 0)
+                        .edit()
+                        .remove(tokenPrefKey(hostApp))
+                        .apply()
+                }
+                onStatus(appContext.getString(R.string.auth_cancelled, hostApp.displayName))
+                notifyConnectionChanged()
+            }
+
+            is AuthResult.AuthFail -> {
+                token = null
+                runCatching {
+                    appContext.getSharedPreferences(PREFS_NAME, 0)
+                        .edit()
+                        .remove(tokenPrefKey(hostApp))
+                        .apply()
+                }
+                onStatus(appContext.getString(R.string.auth_failed_simple, hostApp.displayName))
+                notifyConnectionChanged()
+            }
+        }
+    }
+
+
+
+
+
+
+    // ═══════════════════════════════════════════════════
+    // AI 下行主链路：sendAiTextMessage / sendAiTextViaLink / 拍照答题 / ASR 上行去重与轮询
+    // ═══════════════════════════════════════════════════
+
+
+    fun takeGlassesPhoto(
+        width: Int = 1024,
+        height: Int = 768,
+        quality: Int = 80,
+        onPhoto: (ByteArray) -> Unit,
+        onError: (String) -> Unit,
+    ) = photoQuizService.takeGlassesPhoto(width, height, quality, onPhoto, onError)
+
+    /** 「拍照问 AI」全流程入口（无显式回调，用聊天界面注册的默认回调；编排见 PhotoQuizFlow.start） */
+    fun startPhotoAsk() = photoQuizService.startPhotoAsk()
+
+    /** 「拍照问 AI」全流程入口（显式回调；编排见 PhotoQuizFlow.start） */
+    fun startPhotoAsk(
+        onStage: (Int) -> Unit,
+        onText: (String) -> Unit,
+        onReply: (String) -> Unit,
+        onStageText: (String) -> Unit = {},
+    ) = photoQuizService.startPhotoAsk(onStage, onText, onReply, onStageText)
+
+    /**
+     * 安全切回主线程执行 UI 回调：Activity 已销毁（保活后台运行）时直接跳过，
+     * 避免在已销毁 Activity 上调用 runOnUiThread 导致崩溃，同时下行链路不受影响。
+     */
+    internal fun safeRunOnUiThread(block: () -> Unit) {
+        try {
+            // Activity 已销毁（保活后台运行）或已被回收（弱引用失效）时直接跳过，
+            // 避免在已销毁 Activity 上执行 UI 回调导致崩溃，同时下行链路不受影响。
+            val currentActivity = activityRef.get()
+            if (currentActivity == null || currentActivity.isDestroyed || currentActivity.isFinishing) return
+            mainHandler.post {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    Log.e(TAG, "ui callback error", e)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "safeRunOnUiThread error", e)
+        }
+    }
+
+
+
+
+
+
+    // ═══════════════════════════════════════════════════
+    // 会话生命周期：cleanup（连接/任务/服务绑定统一清理）
+    // ═══════════════════════════════════════════════════
+
+
+
+
+    /**
+     * 会话清理：连接 / 任务 / 服务绑定统一释放。
+     *
+     * @param abortInFlightAi 是否抢占 AI 代际号打断在途 AI 请求（默认 true）。
+     *   `connectAndRunCustomAppOperation()` 首行也调本方法拆旧会话，若此时抢占代际，
+     *   会把「发起本次重连的请求自身」的代际顶掉 —— 慢速路径的 sendAiTextViaLink
+     *   入口校验必然失败（P0：连不上走慢路径时 AI 有响应但永不上屏）。该调用点传 false。
+     */
+    fun cleanup(abortInFlightAi: Boolean = true) {
+        android.util.Log.i("CxrLInstall", "cleanup() called")
+        timeoutJob?.cancel()
+        timeoutJob = null
+        // 停常驻服务探针：它持有本次 link 的引用并周期发帧，不停会随会话重建越积越多
+        glassesProbeJob?.cancel()
+        glassesProbeJob = null
+        asrBridge.stop()
+        // 环境音监听随链路停（状态不持久，默认关 —— 重连后由用户显式再开）
+        ambientListen.markLinkDown()
+        // 补漏：取消其余遗留协程任务（原实现漏取消导致后台任务残留）
+        aiConfig.cancelPushJob()
+        photoQuizService.cancelPhotoRequestTimeout()
+        aiuiHost.stopAgentListPushWindow()
+        // Phase 4：清空等待中的工具确认并摘除全局通道（Session 销毁后拒绝新确认）
+        toolConfirm.abortAll()
+        // v2：停止头动规则引擎（数据流随会话终止，继续 tick 只会空转），并清空陈旧缓冲
+        MotionRuleEngine.stop()
+        MotionBuffer.clear()
+        // 通道常驻：只解绑会话，**不**把 ApprovalGate.confirmationResolver 置 null
+        // （置 null 会让重连后的会话里「打电话」等工具再次被判 no confirmation channel）
+        com.rokidlab.phone.ai.GlassToolConfirmChannel.unbind(this)
+        // 插播 B：复位握手状态，下次连接重新协商眼镜端能力
+        GlassesHandshake.reset()
+        // 复位 AI 场景开关：断线后眼镜端不会补通知（见 aiSceneOpen 注释），
+        // 残留 true 会让重连后的首条下行跳过 waitAiSceneOpen 直接发 ASR_Result ——
+        // 眼镜端场景尚未重开、无会话 item 可写，提问文字静默丢失
+        setAiSceneOpen(false)
+        // 下次会话重新核验眼镜端 BAL 豁免（重装 RokidLink 后 appops 会回到 default）
+        glassesBalExemptConfirmed = false
+        // 解除 Rokid 主机 App 服务绑定（applicationContext 绑定不随 Activity 销毁自动解绑）
+        connection.unbindAllHostServices()
+        // 打断在途 AI：bump 代际号让 deepSeekThread 自弃（避免断连后仍空跑至超时），
+        // 并趁链路尚在通知眼镜端停止播报；随后才断开连接。
+        // abortInFlightAi=false（连接重建场景）时只停播报、不 bump 代际，
+        // 否则会连带废掉发起本次重连的那个请求自身。
+        if (abortInFlightAi) {
+            abortCurrentAi()
+        } else {
+            stopTtsOnGlass()
+        }
+        runCatching { cxrLink?.disconnect() }
+        cxrLink = null
+        // 断开共享 ADB 常驻连接（会话重建/操作失败清理时释放，避免隧道连接泄漏；
+        // 下次工具调用经 getAdbShellClient 自动重建）
+        adbTransport.shutdown()
+        proxyRelay.closeAll()
+        pendingOperation = null
+        queryQueue.clear()
+        cxrlConnected = false
+        glassBtConnected = false
+        operationStarted = false
+        notifyConnectionChanged()
+    }
+
+
+
+
+
+
+
+    // ═══════════════════════════════════════════════════
+    // 连接编排内核 / pending 调度 / 全局指令监听 / bind 反射与授权前置检查
+    // ═══════════════════════════════════════════════════
+
+
+
+    /**
+     * 注册「按键答题」的眼镜端 resume 监听（经 Sys 频道上行触发拍照答题）。
+     *
+     * 注意：SDK 的 [CXRLink.appStart] 内部会调用 setCXRGlassAppCbk(传入 cbk) 覆盖本回调，
+     * 因此 appStart 成功后必须【再次调用本方法】恢复按键答题监听。
+     */
+    internal fun registerKeyQuizResumeListener(link: CXRLink) {
+        // 眼镜端 RokidLink app 的 resume 变化（Sys_App_Resume_Change 经 AI App 无条件转发）：
+        // 按键答题开启时，短按镜腿按键 → 眼镜端模拟 Sys_App_Resume_Change 上行，
+        // SDK 匹配 customAppPackage 后回调 onGlassAppResume(true)，据此触发拍照答题。
+        // appStart 后的真实 resume 通过一次性冷却标志（quizResumeCooling）过滤。
+        link.setCXRGlassAppCbk(object : IGlassAppCbk {
+            override fun onGlassAppResume(resumed: Boolean) {
+                val quiz = appContext.getSharedPreferences(AI_PREFS, 0)
+                    .getBoolean(KEY_KEY_QUIZ_ENABLED, false)
+                // 一次性冷却：消费 appStart 触发的真实 resume（不会再来第二次），
+                // 之后任意时刻按键触发的 resume 不再被时间窗口误过滤（修复「开启后第一次按键没反应」）
+                if (resumed && quizResumeCooling) {
+                    quizResumeCooling = false
+                    Log.i(TAG, "onGlassAppResume: consumed real resume after appStart")
+                    return
+                }
+                Log.i(TAG, "onGlassAppResume: resumed=$resumed quiz=$quiz cooling=$quizResumeCooling")
+                if (resumed) {
+                    // 打断官方 AI 已改由「ASR_READY 信号」驱动（眼镜端收到官方 ASR_End 后经 RFCOMM
+                    // 推送，见 startAiAsrBridgePolling 的 ASR_READY_MARKER 分支）：官方识别完成后
+                    // 才打断，避免固定 800ms 提前打断导致官方识别被掐断、ASR_End 永不产生的竞态。
+                    // 此回调不再承担打断职责。
+                    // 注意：不再用 onGlassAppResume 触发拍照答题！
+                    // SDK 的 onGlassAppResumeChange 按包名匹配回调，任何 RokidLink 的真实 resume
+                    //（AI 会话切换、进程重启等）都会到达这里，无法与眼镜端按键模拟的
+                    // Sys_App_Resume_Change 区分，曾导致「未按键却自动拍照」。
+                    // 拍照意图已改走 RFCOMM 推送通道（PHOTO_ASK_MARKER）+ custom cmd（PHOTO_ASK_CMD）。
+                }
+            }
+
+            override fun onInstallAppResult(success: Boolean) {}
+            override fun onUnInstallAppResult(success: Boolean) {}
+            override fun onOpenAppResult(success: Boolean) {
+                // CUSTOMAPP 会话就绪（appStart 成功 = 自定义指令路由打通）：
+                // 自动开启眼镜端 IMU 头动数据流。**按需开启**（2026-10-24 省电优化，真机实测
+                // 眼镜端 sensors=5.55mAh 为 App 侧最大单项）：唯一连续消费者是头动规则引擎，
+                // 无规则时常开纯浪费 —— 查询/审批路径有 stale 懒重启兜底（ensureStream /
+                // GlassToolConfirmChannel），规则 0→N 时由 set_motion_rule 落库处补发 imu_start。
+                // 开流失败不重试 —— 工具查询侧有懒重启兜底（缓冲 stale > 5s 时重发 imu_start）。
+                if (success) {
+                    // v2：随数据流启动头动规则引擎（无规则时 tick 空转，代价可忽略）
+                    MotionRuleEngine.init(appContext)
+                    MotionRuleEngine.start()
+                    appScope.launch(Dispatchers.IO) {
+                        if (MotionRuleEngine.rules().isNotEmpty()) {
+                            val r = deviceControl.sendImuControl(true)
+                            Log.i(TAG, "imu_start on session open (rules armed) -> $r")
+                        } else {
+                            Log.i(TAG, "imu_start skipped on session open: no motion rules armed")
+                        }
+                    }
+                }
+            }
+            override fun onStopAppResult(success: Boolean) {}
+            override fun onQueryAppResult(installed: Boolean) {}
+        })
+    }
+
+    /**
+     * 统一注册手机端收到的「眼镜 → 手机」指令监听。
+     * 每个新建立的 CXRLink 都要注册一次，处理：
+     *  - Wifi_Connect_Status：WiFi 连接状态回执（转发给 sendWifiConfig）
+     *  - rokidlab_photo_ask：眼镜端镜腿按键触发「拍照问AI」
+     */
+    internal fun registerGlobalCmdListener(link: CXRLink) {
+        try {
+            registerKeyQuizResumeListener(link)
+
+            link.setCXRCustomCmdCbk { cmd, data ->
+                Log.i(TAG, "onCustomCmdResult: cmd=$cmd, dataLen=${data?.size ?: 0}")
+                when (cmd) {
+                    "Wifi_Connect_Status" -> {
+                        // 眼镜端可能借该白名单通道上行 ASR 文字（caps: ["ASR_TEXT", text]），
+                        // 或上行普通 WiFi 状态回执 JSON（配 WiFi 时）。
+                        val asrText = parseAiAsrPollText(data)
+                        if (!asrText.isNullOrBlank()) {
+                            Log.i(TAG, "Wifi_Connect_Status carrying ASR text: $asrText")
+                            // onAsrText 现在只做「入队到 ASR 单消费者串行队列」（非阻塞），
+                            // 可直接在 binder 线程调用：既避免独占 binder 线程池，
+                            // 又保证入队顺序严格 FIFO（不再经 launch 二次调度导致后发先至）
+                            asrBridge.onAsrText(asrText)
+                        } else {
+                            val json = String(data ?: ByteArray(0))
+                            Log.i(TAG, "Received Wifi_Connect_Status: $json")
+                            wifiStatusCallback?.invoke(json)
+                        }
+                    }
+                    PHOTO_ASK_CMD -> {
+                        Log.i(TAG, "Photo-ask triggered from glasses button")
+                        // 拍照+OCR+AI 全流程耗时数秒，同样切后台线程执行
+                        appScope.launch(Dispatchers.IO) { startPhotoAsk() }
+                    }
+                    LinkProtocol.TOPIC_TOOL_CONFIRM_RESULT -> {
+                        // Phase 4：眼镜端工具确认结果回执（binder 线程，仅 countDown 无阻塞）
+                        val f = capsToFieldList(data)
+                        val confirmId = f.getOrNull(0)
+                        if (!confirmId.isNullOrBlank()) {
+                            toolConfirm.onResult(confirmId, f.getOrNull(1) == "yes")
+                        }
+                    }
+                    LinkProtocol.TOPIC_RECORD_RESULT -> {
+                        // 眼镜摄像头录像结果（Cap.RECORD）：binder 线程只解码+投递，
+                        // 拉文件/产物登记由等待方（GlassesRecordToolProvider）在自己的线程做。
+                        val f = capsToFieldList(data)
+                        GlassesRecordChannel.onResult(
+                            f.getOrNull(0).orEmpty(),
+                            f.getOrNull(1).orEmpty(),
+                        )
+                    }
+                    AiChannel.TOPIC_CHART_RESEND -> {
+                        // 图表查看器单击重发（Cap.CHART_VIEW）：按 chartId 从最近推送缓存
+                        // 重发同一张图 —— 眼镜端解码失败/传输损坏后的自助恢复；未命中静默忽略。
+                        val chartId = AiChannel.decodeChartResend(capsToFieldList(data))
+                        if (!chartId.isNullOrBlank()) {
+                            appScope.launch(Dispatchers.IO) { ChartGlassPush.onResendRequest(chartId) }
+                        }
+                    }
+                    AiChannel.TOPIC_CUSTOM_IMG_REQ -> {
+                        // 眼镜端探测到官方助手页进前台，来要「自定义图」。
+                        // 开关没开/没存图 → publishIfEnabled 静默不回（不是错误状态）。
+                        if (AiChannel.decodeCustomImgReq(capsToFieldList(data))) {
+                            appScope.launch(Dispatchers.IO) { GlassCustomImage.publishIfEnabled(appContext) }
+                        } else {
+                            Log.w(TAG, "custom_img_req: rejected invalid payload")
+                        }
+                    }
+                    LinkProtocol.TOPIC_HELLO -> {
+                        // 插播 B：眼镜端协议版本/能力通告
+                        // （caps = [version, capsBitmask, linkVersion, processStartAt]）
+                        val f = capsToFieldList(data)
+                        val ver = f.getOrNull(0)?.toIntOrNull() ?: 0
+                        val caps = f.getOrNull(1)?.toIntOrNull() ?: 0
+                        // 第 4 字段：眼镜端进程启动标记（2026-10-24 新增；旧版眼镜端不带上 → null）
+                        val serviceStartAt = f.getOrNull(3)?.toLongOrNull()
+                        GlassesHandshake.onHello(ver, caps, f.getOrNull(2))
+                        // 版本比对联动：握手刷新即重算「眼镜端是否落后」（启动引导 redesign）
+                        runCatching { onGlassesHello?.invoke(GlassesHandshake.linkVersion) }
+                        // 行为类开关收敛：见到新的进程世代（眼镜端重启/重装过，prefs 可能已丢）
+                        // 就把手机端真值补推一遍（详见 syncBehaviorSwitchesToGlasses）
+                        syncBehaviorSwitchesToGlasses(serviceStartAt)
+                    }
+                    AI_ASR_POLL_CMD -> {
+                        val text = parseAiAsrPollText(data)
+                        if (!text.isNullOrBlank()) {
+                            Log.i(TAG, "AI ASR poll got text: $text")
+                            // 同上：仅入队，非阻塞，可在 binder 线程直接调用以保证 FIFO
+                            asrBridge.onAsrText(text)
+                        }
+                    }
+                    "Proxy" -> {
+                        // 眼镜端 AssistServer NetProxy 请求（Jsai 下载 .aix 时眼镜经手机代理拉文件）。
+                        // 手机侧作为 TCP 中继应答：解析 Proxy_NetRequest → 本机 socket 收发 →
+                        // 以 Proxy_NetResponse 应答（协议与状态机详见 GlassProxyRelay）。
+                        proxyRelay.onInbound(data)
+                    }
+                    AiChannel.TOPIC_GLASSES_IP -> {
+                        // 眼镜端连上 WiFi 后自动上报自身 IP，手机端据此免手动输入，
+                        // 自动回填到投屏 / 手机镜像 / 文件管理 / ADB 共用的单一数据源。
+                        val ip = AiChannel.decodeGlassesIp(capsToFieldList(data))
+                        if (!ip.isNullOrBlank()) {
+                            Log.i(TAG, "Received glasses WiFi IP from link: $ip")
+                            (appContext as? LabApplication)?.setGlassesIp(ip)
+                        } else {
+                            Log.w(TAG, "Received glasses IP payload but decode failed (size=${data?.size ?: 0})")
+                        }
+                    }
+                    AiChannel.TOPIC_IMU_DATA -> {
+                        // v1 查询层：眼镜端 ~20Hz 头动数据批量上行（500ms/批），写入环形缓冲。
+                        // 消费方：get_head_pose / get_motion_history 工具与 v2 规则引擎。
+                        // binder 线程只做解码+入缓冲（O(n) 拷贝，无阻塞）。
+                        val samples = AiChannel.decodeImuData(capsToFieldList(data))
+                        if (samples != null) {
+                            MotionBuffer.append(samples)
+                        } else {
+                            Log.w(TAG, "imu_data payload decode failed (size=${data?.size ?: 0})")
+                        }
+                    }
+                    "Jsai_GetRequestInfo" -> {
+                        // 眼镜发起「agent 目录配置询问」（phone_request_info 飞行，60s 内首个回复被认领：
+                        // claimPhoneResponse → parseMobileRequestInfo → JsaiAuthStore.update → 用新 URL 重拉）。
+                        // 仅在本地有托管目录时回复，避免无谓覆盖官方配置导致官方 agent 被 purge。
+                        val catalogUrl = AiuiProject.currentCatalogUrl()
+                        if (catalogUrl != null) {
+                            val r = pushAiuiAgentListUrl(catalogUrl)
+                            Log.i(TAG, "Jsai_GetRequestInfo asked -> replied catalogUrl=$catalogUrl result=$r")
+                        } else {
+                            Log.i(TAG, "Jsai_GetRequestInfo asked -> no hosted catalog, keep silent")
+                        }
+                    }
+                    else -> {
+                        Log.d(TAG, "Unhandled cmd: $cmd")
+                    }
+                }
+            }
+            // 插播 B：主动询问眼镜端协议版本/能力（旧版眼镜端不应答 → 超时判为 legacy）
+            requestGlassesHello(link)
+            // 常驻服务存活探针：眼镜端被 AssistServer 强杀后它自己无法复活（force-stop 清 alarm
+            // 且置 stopped=true），只能由手机端经 ADB 拉起。原先拉起只发生在「用户恰好调用了
+            // 显示类工具」时，这里改成自主周期检查。
+            startGlassesServiceProbe(link)
+        } catch (e: Exception) {
+            Log.e(TAG, "registerGlobalCmdListener failed", e)
+        }
+    }
+
+    /**
+     * 发送协议握手请求 [LinkProtocol.TOPIC_HELLO_REQ]，并启动「旧版眼镜端」判定计时。
+     * 眼镜端服务就绪时也会主动通告，此处请求用于覆盖「眼镜端后启动 / 手机端重连」。
+     */
+    internal fun requestGlassesHello(link: CXRLink) {
+        runCatching {
+            val r = rawSendCustomCmd(link, LinkProtocol.TOPIC_HELLO_REQ, Caps())
+            Log.i(TAG, "hello request sent -> $r (current: ${GlassesHandshake.describe()})")
+        }.onFailure { Log.w(TAG, "hello request failed: ${it.message}") }
+        // 超时未见通告 → 判为旧版眼镜端：后续副作用工具确认立即降级，不再空等 35s
+        appScope.launch {
+            delay(GlassesHandshake.LEGACY_DETECT_DELAY_MS)
+            GlassesHandshake.markLegacy()
+        }
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 眼镜端常驻服务存活探针（进程被强杀后的恢复）
+    // ═══════════════════════════════════════════════════
+
+    /**
+     * 启动周期探针：判定眼镜端 RokidLink 是否还在跑，不在则经 ADB 拉起。
+     *
+     * ## 为什么必须由手机端来做
+     *
+     * 眼镜端 RokidLink 被 **force-stop**（AssistServer 场景抢占走的就是这条路，真机日志
+     * `Force stopping com.rokidlab.rokidlink ... from pid 2013`）之后，它**自己无法复活**：
+     * force-stop 会置 `stopped=true` 并清除该包所有 alarm/job，此后 START_STICKY、
+     * BOOT_COMPLETED、Alarm 心跳（眼镜端 `ResidentWatchdog`）**全部失效**。
+     * 唯一合法突破点是外部拉起 —— `stopped=true` 的包允许被 ADB shell 的
+     * `am start-foreground-service` 启动，也就是 [ToolRegistry.ensureGlassesLinkRunning]。
+     *
+     * 原先该函数**只有一个调用点**（`DisplayToolProvider`，`show_image` 失败后顺手拉一次），
+     * 于是恢复完全取决于用户是否恰好触发过一次显示类工具。本探针把它升级为自主行为。
+     *
+     * ## 判活依据
+     *
+     * 手机侧的 CXR 链路连的是眼镜**系统**的 cxr-service，**不是** RokidLink 进程 ——
+     * 所以 `cxrlConnected` / `glassBtConnected` 在 RokidLink 死后**依然为真**，
+     * 不能用来判断它是否还活着。可靠信号有两个：
+     *  1. **HELLO 新鲜度**：眼镜端服务就绪会回 [LinkProtocol.TOPIC_HELLO]。
+     *     只看一次不够 —— 它死后不会有人来把 `known` 复位，据 `known` 判断会把尸体当活人；
+     *     必须看 [GlassesHandshake.lastHelloAtMs] 是否在本轮窗口内被刷新。
+     *  2. **进程实况**：HELLO 没来时用 ADB `pidof` 直接问设备（见 [readGlassesLinkPid]）。
+     *     这一步不能省 —— 旧版眼镜端（v1，无握手能力）同样「不应答 HELLO」，
+     *     若把「无应答」直接当成「进程已死」，就会对着一台正常运行的旧版设备反复发拉起命令。
+     *
+     * ## 恢复动作是分层的（重要）
+     *
+     * | 判定 | 动作 | 依赖 |
+     * |---|---|---|
+     * | `pid == 0`（确实不在跑） | ADB `am start-foreground-service`（[ToolRegistry.ensureGlassesLinkRunning]） | 需要 ADB 可达 |
+     * | `pid == null`（ADB 不可达） | CXR appStart（[launchGlassesLinkViaCxr]） | 只需眼镜系统 AI App |
+     * | `pid > 0`（活着但静默） | 不动作 | —— |
+     *
+     * 第二层是为「force-stop 把 ADB 通道一起带走」而加的：ADB 走蓝牙隧道，而隧道服务端就在
+     * 被杀的进程里 ⇒ 最需要恢复的场景恰好用不了 ADB（2026-09-18 实测）。详见 [launchGlassesLinkViaCxr]。
+     */
+    internal fun startGlassesServiceProbe(link: CXRLink) {
+        glassesProbeJob?.cancel()
+        glassesProbeJob = appScope.launch {
+            delay(PROBE_FIRST_DELAY_MS)
+            while (isActive) {
+                runCatching { probeGlassesResidentServiceOnce(link) }
+                    .onFailure { Log.w(TAG, "glasses service probe error: ${it.message}") }
+                delay(PROBE_INTERVAL_MS)
+            }
+        }
+        Log.i(TAG, "glasses resident-service probe started (every ${PROBE_INTERVAL_MS}ms)")
+    }
+
+    /** 探针单轮：先看握手新鲜度，不新鲜则用 pidof 定论，确认不在才拉起。 */
+    private suspend fun probeGlassesResidentServiceOnce(link: CXRLink) {
+        if (!cxrlConnected) {
+            Log.d(TAG, "probe: cxrl disconnected, skip")
+            return
+        }
+        val before = GlassesHandshake.lastHelloAtMs
+        // 低成本路径：一条 CXR 空帧，不占 ADB 隧道
+        runCatching { rawSendCustomCmd(link, LinkProtocol.TOPIC_HELLO_REQ, Caps()) }
+            .onFailure { Log.w(TAG, "probe: hello_req send failed: ${it.message}") }
+        delay(PROBE_ACK_TIMEOUT_MS)
+        if (GlassesHandshake.lastHelloAtMs > before) {
+            Log.d(TAG, "probe: glasses resident service healthy (hello refreshed)")
+            // 同类横扫（审批手势保活）：probe 复活不走 onOpenAppResult，此前只补 IMU 流不补引擎 ——
+            // 引擎没 start 时 MotionBuffer 有数据也没人消费（点头确认无反应）。init/start 均幂等。
+            MotionRuleEngine.init(appContext)
+            MotionRuleEngine.start()
+            // IMU 流活性兜底：会话恢复（probe 复活）不走 onOpenAppResult，imu_start 可能永远补不上；
+            // 眼镜端 IMU 默认关 + 断连自停 —— 数据 stale > 15s 时补发拉流（眼镜端幂等，重复 start 会被忽略）
+            appScope.launch(Dispatchers.IO) {
+                runCatching {
+                    val staleMs = System.currentTimeMillis() - (MotionBuffer.latest()?.t ?: 0L)
+                    if (staleMs > 15_000L) {
+                        val r = deviceControl.sendImuControl(true)
+                        Log.i(TAG, "probe: imu stale ${staleMs}ms, re-armed -> $r")
+                    }
+                }
+            }
+            return
+        }
+
+        // 握手没刷新 —— 可能是进程死了，也可能是旧版眼镜端/瞬时丢帧。用设备实况定论。
+        //
+        // 节流：ADB 校验失败（无共享会话 / 线路不通）意味着「注定失败的一次建链」，
+        // 那可能是最长 25s 的阻塞（TCP 10s + 握手 15s）。一分钟一次纯耗电无收益，
+        // 故失败后退避 ADB_VERIFY_BACKOFF_MS；一旦成功判定则立即恢复每分钟校验。
+        if (System.currentTimeMillis() < nextAdbVerifyAtMs) {
+            Log.i(TAG, "probe: no hello, ADB verification backed off — skip this round")
+            return
+        }
+        val pid = readGlassesLinkPid()
+        if (pid == null) {
+            nextAdbVerifyAtMs = System.currentTimeMillis() + ADB_VERIFY_BACKOFF_MS
+            Log.w(
+                TAG,
+                "probe: no hello and cannot verify glasses process (ADB unavailable); " +
+                    "back off ${ADB_VERIFY_BACKOFF_MS}ms",
+            )
+            // ★ 不要就此放弃 —— 这正是「眼镜端进程已被强杀」的典型现场：
+            //   ADB 走蓝牙隧道，而隧道的服务端 BtTunnelServer 就住在被杀的进程里 ⇒
+            //   验证通道与恢复通道**与病人同生共死**（2026-09-18 端到端实测：force-stop 后
+            //   探针报 no shared adb session，150s 也没能拉起）。
+            //   改走 CXR appStart：那条链路经眼镜**系统 AI App** 执行，与我们自己的进程无关。
+            launchGlassesLinkViaCxr()
+            return
+        }
+        nextAdbVerifyAtMs = 0L
+        if (pid > 0L) {
+            Log.i(
+                TAG,
+                "probe: glasses process alive (pid=$pid) but not answering hello -> " +
+                    "treat as legacy/silent, no pull",
+            )
+            return
+        }
+        Log.w(TAG, "probe: glasses resident service NOT running (pidof empty) -> pulling via ADB")
+        val ok = ToolRegistry.ensureGlassesLinkRunning(appContext)
+        Log.w(TAG, "probe: ensureGlassesLinkRunning -> $ok")
+    }
+
+    /**
+     * 经「眼镜端系统 AI App」拉起 RokidLink（CXR appStart 通道）—— **不依赖眼镜端进程存活**。
+     *
+     * ## 为什么需要它
+     *
+     * ADB 是首选通道（`ToolRegistry.ensureGlassesLinkRunning`），但它**只在眼镜端进程活着时可用**：
+     * 手机到眼镜的 ADB 走蓝牙隧道，而隧道的服务端 `BtTunnelServer` 就住在被杀的进程里。
+     * 于是「眼镜端被 force-stop」这个最需要恢复的场景，恰好把 ADB 通道一起带走了
+     * （2026-09-18 实测：force-stop 后探针报 `no shared adb session`，150s 无恢复；
+     * 且实测环境眼镜 WiFi 关闭 ⇒ adbd 虽在 `[::]:5555` 监听却没有任何 IP 可达，无旁路）。
+     *
+     * `appStart` 走的是另一条链路：请求由眼镜**系统 AI App / cxr-service** 执行，
+     * 它们不随我们的进程消亡。项目里本来就用它来启动 RokidLink 自己
+     * （见 `RokidLinkController.autoStartRokidLink` / `ensureRokidLinkRunning`），
+     * 只是此前只在**界面进入前台**时触发，没有自主重试。
+     *
+     * ## ⚠️ 两个必须注意的点
+     *
+     * 1. **必须在独立协程里调用**：`launchApp` → `connectAndRunCustomAppOperation` 的首行是
+     *    `session.cleanup()`，而 [cleanup] 会 `glassesProbeJob?.cancel()` —— 直接在探针协程里
+     *    调用等于**中途把自己拆掉**（后续判定全部不再执行）。所以这里另起 `appScope.launch`。
+     *    同理，链路重建完成后 `onConnected → maybeRunPendingOperation → registerGlobalCmdListener
+     *    → startGlassesServiceProbe` 会**重新挂上一个新探针**，所以自我取消不会让探针永久消失。
+     * 2. **必须节流**：该调用会拆掉并重建整条 CXR 链路，代价远高于一次 `pidof`，
+     *    故用 [CXR_LAUNCH_BACKOFF_MS] 限制到 5 分钟一次。
+     *
+     * @return true = 本次真的发起了尝试（被节流时返回 false）
+     */
+    private fun launchGlassesLinkViaCxr(): Boolean {
+        // 未授权时不要走这条路：launchApp → hasGlassesOperationPrerequisites(…, requestAuthorizationIfMissing = true)
+        // 在 token 为空时会**去拉起授权页**；无界面会话（保活重建）下这是用户完全没预期的弹窗。
+        // 没有 token 时 CXR 链路本就用不起来，直接放弃更诚实。
+        if (!hasAuthorization()) {
+            Log.w(TAG, "probe: CXR appStart fallback skipped (no authorization token)")
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (now < nextCxrLaunchAtMs) {
+            Log.i(
+                TAG,
+                "probe: CXR appStart fallback throttled, next in ${(nextCxrLaunchAtMs - now) / 1000}s",
+            )
+            return false
+        }
+        nextCxrLaunchAtMs = now + CXR_LAUNCH_BACKOFF_MS
+        Log.w(
+            TAG,
+            "probe: ADB unavailable -> fallback to CXR appStart for $GLASSES_LINK_PKG " +
+                "(系统 AI App 执行，不依赖眼镜端进程)",
+        )
+        appScope.launch {
+            runCatching {
+                launchApp(
+                    packageName = GLASSES_LINK_PKG,
+                    onLaunchResult = { ok ->
+                        Log.w(TAG, "probe: CXR appStart $GLASSES_LINK_PKG -> launched=$ok")
+                    },
+                )
+            }.onFailure { Log.e(TAG, "probe: CXR appStart threw", it) }
+        }
+        return true
+    }
+
+    /**
+     * 读眼镜端 RokidLink 的 pid。
+     *
+     * @return `0` = 进程确实不存在（pidof 有输出格式但无匹配）；
+     *         正数 = 存活 pid；
+     *         `null` = **无法判定**（无共享 ADB 会话、命令失败、或输出无法识别）。
+     *         调用方只在拿到 `0` 时才拉起 —— 无法判定时宁可不动，避免误拉起。
+     *
+     * 复用全 App 共享 ADB 会话（不新建）：投屏/文件提取等长连接占用隧道时，
+     * [getAdbShellClient] 内部的 `ChannelArbiter` 守卫会返回 null，本方法随之返回 null 并跳过本轮 ——
+     * 这条探针是「锦上添花」，绝不能去抢用户正在用的那条唯一 RFCOMM。
+     */
+    private fun readGlassesLinkPid(): Long? {
+        val client = getAdbShellClient() ?: run {
+            Log.i(TAG, "probe: no shared adb session, cannot verify glasses process")
+            return null
+        }
+        val out = runCatching {
+            client.executeShellCommand("pidof $GLASSES_LINK_PKG", PROBE_PIDOF_TIMEOUT_MS)
+        }.onFailure { Log.w(TAG, "probe: pidof failed: ${it.message}") }.getOrNull() ?: return null
+        Regex("\\d+").find(out)?.let { return it.value.toLong() }
+        val trimmed = out.trim()
+        // pidof 无匹配时输出为空；空输出即「进程不存在」，这是唯一可下结论的情形。
+        if (trimmed.isEmpty()) return 0L
+        Log.w(TAG, "probe: unexpected pidof output: ${trimmed.take(80)}")
+        return null
+    }
+
+
+    internal fun isWifiEnabled(): Boolean {
+        val wifiManager = appContext.getSystemService(WifiManager::class.java)
+        return wifiManager?.isWifiEnabled == true
+    }
+
+    internal fun hasGlassesOperationPrerequisites(
+        targetHostApp: RokidHostApp,
+        requestAuthorizationIfMissing: Boolean,
+    ): Boolean {
+        if (!isHostAppInstalled(targetHostApp)) {
+            onStatus(appContext.getString(R.string.install_host_first, targetHostApp.displayName))
+            return false
+        }
+        // 建链兜底：Rokid AI App 版本过低时授权/建链都会失败，提前拦截
+        if (rokidAppStatus(targetHostApp) is RokidAppStatus.VersionTooLow) {
+            onStatus(appContext.getString(R.string.auth_host_version_too_low, targetHostApp.displayName))
+            return false
+        }
+        if (token.isNullOrBlank()) {
+            onStatus(appContext.getString(R.string.authorize_in_host, targetHostApp.displayName))
+            if (requestAuthorizationIfMissing) requestAuthorization()
+            return false
+        }
+        return true
+    }
+
+
+    internal fun notifyConnectionChanged() {
+        // HUD 数据下行：链路状态是 bind 的 link 键（同值幂等不发）；
+        // 重连瞬间眼镜端 dataMap 是空的，全量重发补齐断连期间错过的增量
+        HudDataHub.updateLink(cxrlConnected)
+        if (cxrlConnected) HudDataHub.resendAll()
+        onConnectionChanged(
+            CxrConnectionState(
+                authorized = hasAuthorization(),
+                cxrlConnected = cxrlConnected,
+                glassBtConnected = glassBtConnected,
+            ),
+        )
+    }
+}

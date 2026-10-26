@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Status strings -->
+    <string name="status_checking_wifi">检查 WiFi...</string>
+    <string name="status_wifi_disabled">WiFi 未开启</string>
+    <string name="status_wifi_disconnected">WiFi 已断开</string>
+    <string name="status_not_connected_wifi">未连接 WiFi</string>
+    <string name="status_wifi_connected">WiFi: %1$s</string>
+    <string name="status_bt_ready">BT Ready</string>
+    <string name="status_bt_ready_desc">蓝牙通道就绪，无需 WiFi</string>
+    <string name="status_checking_adb">检查 ADB 状态...</string>
+    <string name="status_ready">已就绪</string>
+    <string name="status_enabling_adb">正在开启 ADB...</string>
+    <string name="status_adb_failed">ADB 开启失败，请重启 App</string>
+    <!-- Log messages (English only, developer-facing) -->
+    <string name="log_network_recovered">Network recovered, rechecking status</string>
+    <string name="log_wifi_disconnected">WiFi disconnected</string>
+    <string name="log_network_switched">Network switched to non-WiFi, marking as disconnected</string>
+    <string name="log_try_enable_adb_tcp">Trying to enable ADB TCP mode...</string>
+    <string name="log_try_attempt">Attempt #%d: ctl.restart adbd</string>
+    <string name="log_adb_tcp_enabled">ADB TCP enabled (after %d attempts, %ds)</string>
+    <string name="log_interrupted">ADB enable thread interrupted, exiting gracefully</string>
+    <string name="log_retry_failed">Retried 3 times but still cannot enable ADB TCP</string>
+    <string name="log_command_failed">Command failed: %s</string>
+    <string name="log_setprop_failed">setprop failed: %s</string>
+    <string name="log_get_ip_failed">Failed to get IP address</string>
+    <!-- Chart fullscreen viewer -->
+    <string name="chart_viewer_hint">滑动切换 · 单击重发 · 双击退出</string>
+    <string name="chart_viewer_index">%1$d/%2$d</string>
+    <!-- AI 模式切换 -->
+    <string name="ai_mode_official_toast">已切换到官方档，语音由官方乐奇回复</string>
+</resources>

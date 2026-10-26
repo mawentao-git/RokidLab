@@ -1,0 +1,469 @@
+package com.rokidlab.phone.store
+
+import com.rokidlab.phone.ai.AgentStep
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
+
+/**
+ * 聊天历史落盘格式（[ChatHistoryStore]）的回归测试。
+ *
+ * 为什么值得锁：#9 之前每次追加消息都**重写整份 JSON 数组**（O(n²) 写放大）且在主线程做，
+ * 改成 JSONL 增量写 + 后台串行落盘后，"后写覆盖先写"、"旧格式迁移不丢历史"、
+ * "崩溃留下的半行不毁掉整份历史"这三条语义一旦漂移，用户看到的是**聊天记录静默丢失**。
+ */
+class ChatHistoryStoreTest {
+
+    @get:Rule
+    val tmp = TemporaryFolder()
+
+    private fun msg(
+        id: Long,
+        content: String,
+        isUser: Boolean = false,
+        isStatus: Boolean = false,
+        imageUrl: String? = null,
+        trace: List<AgentStep> = emptyList(),
+    ) = ChatMsg(
+        id = id,
+        isUser = isUser,
+        content = content,
+        time = "10:00",
+        isStatus = isStatus,
+        imageUrl = imageUrl,
+        trace = trace,
+    )
+
+    private fun steps() = listOf(
+        AgentStep(key = "think:0", kind = AgentStep.Kind.THINKING, title = "", detail = "先看看要调什么"),
+        AgentStep(
+            key = "tool:call_1",
+            kind = AgentStep.Kind.TOOL,
+            title = "control_music",
+            detail = "{\"songName\":\"西厢\"} → 已开始播放《西厢》",
+            state = AgentStep.State.OK,
+        ),
+        AgentStep(
+            key = "tool:call_2",
+            kind = AgentStep.Kind.TOOL,
+            title = "install_aiui_project",
+            detail = "→ 工具执行失败: 眼镜未连接",
+            state = AgentStep.State.FAILED,
+        ),
+    )
+
+    private fun newFile(name: String = "chat_history.json"): File = File(tmp.newFolder(), name)
+
+    private fun legacyArrayJson(vararg msgs: ChatMsg): String {
+        val arr = JSONArray()
+        msgs.forEach { arr.put(JSONObject(ChatHistoryStore.toLine(it))) }
+        return arr.toString()
+    }
+
+    // ── 往返与覆盖语义 ──
+
+    @Test
+    fun `单条往返保留全部字段`() {
+        val src = msg(7, "你好", isUser = true, imageUrl = "https://x/y.png")
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals(7L, back.id)
+        assertTrue(back.isUser)
+        assertEquals("你好", back.content)
+        assertEquals("10:00", back.time)
+        assertEquals("https://x/y.png", back.imageUrl)
+    }
+
+    @Test
+    fun `imageUrl 缺省时落盘不含该字段且回放为 null`() {
+        val src = msg(1, "纯文本")
+        assertFalse("缺省 imageUrl 不应写入字段", ChatHistoryStore.toLine(src).contains("imageUrl"))
+        assertNull(ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single().imageUrl)
+    }
+
+    @Test
+    fun `同 id 后写覆盖先写且位置不变`() {
+        // finalizeLastAi 的落盘形态：先追加正文首版，再追加同 id 的完整版
+        val text = listOf(
+            ChatHistoryStore.toLine(msg(1, "你是")),
+            ChatHistoryStore.toLine(msg(2, "在吗", isUser = true)),
+            ChatHistoryStore.toLine(msg(1, "你好，我是乐奇")),
+        ).joinToString("\n")
+        val out = ChatHistoryStore.parse(text)
+        assertEquals("覆盖行不应新增条目", 2, out.size)
+        assertEquals("位置沿用首次出现", 1L, out[0].id)
+        assertEquals("你好，我是乐奇", out[0].content)
+        assertEquals(2L, out[1].id)
+    }
+
+    @Test
+    fun `无 id 的条目按独立条目保留不去重`() {
+        val text = listOf(
+            "{\"content\":\"a\"}",
+            "{\"content\":\"b\"}",
+        ).joinToString("\n")
+        val out = ChatHistoryStore.parse(text)
+        assertEquals(2, out.size)
+        assertEquals(listOf("a", "b"), out.map { it.content })
+    }
+
+    // ── 崩溃/脏数据容错 ──
+
+    @Test
+    fun `非法行与空行被跳过而非整体失败`() {
+        val text = listOf(
+            ChatHistoryStore.toLine(msg(1, "第一条")),
+            "",
+            "这不是 JSON",
+            "{}",
+            ChatHistoryStore.toLine(msg(2, "第二条")),
+        ).joinToString("\n")
+        val out = ChatHistoryStore.parse(text)
+        assertEquals(2, out.size)
+        assertEquals(listOf("第一条", "第二条"), out.map { it.content })
+    }
+
+    @Test
+    fun `写入中途被截断的半行不影响已落盘历史`() {
+        // 崩溃时可能留下 `{"id":3,"conte` 这样的半行
+        val text = ChatHistoryStore.toLine(msg(1, "已保存")) + "\n" + "{\"id\":3,\"conte"
+        val out = ChatHistoryStore.parse(text)
+        assertEquals(1, out.size)
+        assertEquals("已保存", out[0].content)
+    }
+
+    @Test
+    fun `上限之外的旧消息被裁掉只留最新`() {
+        val text = (1..10).joinToString("\n") { ChatHistoryStore.toLine(msg(it.toLong(), "m$it")) }
+        val out = ChatHistoryStore.parse(text, maxHistory = 3)
+        assertEquals(listOf("m8", "m9", "m10"), out.map { it.content })
+    }
+
+    // ── 旧格式迁移 ──
+
+    @Test
+    fun `旧版 JSON 数组格式被识别并完整迁移不丢历史`() {
+        val legacy = legacyArrayJson(msg(1, "旧一"), msg(2, "旧二", isUser = true), msg(3, "旧三"))
+        assertTrue(ChatHistoryStore.isLegacyFormat(legacy))
+        val out = ChatHistoryStore.parse(legacy)
+        assertEquals(3, out.size)
+        assertEquals(listOf("旧一", "旧二", "旧三"), out.map { it.content })
+        assertTrue(out[1].isUser)
+    }
+
+    @Test
+    fun `旧格式数组内含非法元素时跳过该元素而非整份丢弃`() {
+        val legacy = "[{\"id\":1,\"content\":\"ok\"}, \"裸字符串\", {\"id\":2,\"content\":\"ok2\"}]"
+        val out = ChatHistoryStore.parse(legacy)
+        assertEquals(listOf("ok", "ok2"), out.map { it.content })
+    }
+
+    @Test
+    fun `迁移写回 JSONL 后不再是旧格式且可继续增量追加`() {
+        val file = newFile()
+        val legacy = legacyArrayJson(msg(1, "旧一"), msg(2, "旧二"))
+        file.writeText(legacy)
+
+        // 模拟 ChatStateHolder.load() 的迁移动作
+        val loaded = ChatHistoryStore.readHistory(file)
+        ChatHistoryStore.rewrite(file, loaded.map { ChatHistoryStore.toLine(it) })
+
+        val afterMigration = file.readText()
+        assertFalse("迁移后首字符不应再是 '['", ChatHistoryStore.isLegacyFormat(afterMigration))
+        ChatHistoryStore.appendLine(file, ChatHistoryStore.toLine(msg(3, "新三")))
+        assertEquals(listOf("旧一", "旧二", "新三"), ChatHistoryStore.readHistory(file).map { it.content })
+    }
+
+    // ── 过程（思考 / 工具调用）字段 ──
+
+    @Test
+    fun `过程步骤往返保留顺序键类型状态与摘要`() {
+        val src = msg(9, "已为你播放", trace = steps())
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals(3, back.trace.size)
+        assertEquals(listOf("think:0", "tool:call_1", "tool:call_2"), back.trace.map { it.key })
+        assertEquals(AgentStep.Kind.THINKING, back.trace[0].kind)
+        assertEquals(AgentStep.Kind.TOOL, back.trace[1].kind)
+        assertEquals("control_music", back.trace[1].title)
+        assertEquals(AgentStep.State.OK, back.trace[1].state)
+        assertEquals(AgentStep.State.FAILED, back.trace[2].state)
+        assertTrue(
+            "结果摘要要能往返",
+            back.trace[1].detail.contains("已开始播放《西厢》"),
+        )
+    }
+
+    @Test
+    fun `文件产物往返保留路径与动作`() {
+        //⚠️ 产物**必须**落盘：否则重启后芯片全部消失（文件还在、用户却点不开了），
+        //   那种"新会话能看、旧会话不能看"的不一致比不做更让人怀疑数据丢了。
+        val withArtifact = AgentStep.tool(
+            callId = "call_7",
+            name = "apply_patch",
+            state = AgentStep.State.OK,
+            argsRaw = """{"project":"demo","path":"a.txt"}""",
+            result = "已应用",
+        ).copy(
+            artifacts = listOf(
+                AgentStep.Artifact("/files/aiui_projects/demo/a.txt", "a.txt", AgentStep.Action.WRITE),
+                AgentStep.Artifact("/files/aiui_projects/demo/b.png", "b.png", AgentStep.Action.CREATE),
+            )
+        )
+        val src = msg(3, "改好了", trace = listOf(withArtifact))
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals(2, back.trace[0].artifacts.size)
+        assertEquals("/files/aiui_projects/demo/a.txt", back.trace[0].artifacts[0].path)
+        // 展示名回放时统一补成「项目名/相对路径」（旧数据即便只存了文件名也会被补全）
+        assertEquals("demo/a.txt", back.trace[0].artifacts[0].label)
+        assertEquals(AgentStep.Action.WRITE, back.trace[0].artifacts[0].action)
+        assertEquals(AgentStep.Action.CREATE, back.trace[0].artifacts[1].action)
+    }
+
+    @Test
+    fun `没有产物的步骤落盘不含产物字段`() {
+        val src = msg(4, "", trace = steps())
+        assertFalse(ChatHistoryStore.toLine(src).contains("\"r\""))
+        assertTrue(ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single().trace.all { it.artifacts.isEmpty() })
+    }
+
+    @Test
+    fun `命令卡的命令与输出往返保留`() {
+        // ⚠️ 命令卡依赖 command/output 两个字段落地：不落盘则重启后退化成普通工具行
+        //（命令块与可展开输出全没了）。
+        val withCommand = AgentStep.tool(
+            callId = "call_8",
+            name = "run_shell",
+            state = AgentStep.State.OK,
+            argsRaw = """{"command":"ls -R ."}""",
+            result = "退出码 0\n\n[标准输出]\nindex.ink",
+        )
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(msg(8, "跑完了", trace = listOf(withCommand)))).single()
+        assertEquals("ls -R .", back.trace[0].command)
+        assertTrue("真实输出要能往返", back.trace[0].output!!.contains("index.ink"))
+    }
+
+    @Test
+    fun `旧历史没有命令字段时回放为 null`() {
+        // 老版本落盘的 trace 行没有 c/o —— 回放必须退化成普通工具行：不崩、不变出一张空命令卡
+        val legacy = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[{"k":"tool:x","i":"TOOL","t":"run_shell","d":"ls → 退出码 0","s":"OK"}]}"""
+        val back = ChatHistoryStore.parse(legacy).single()
+        assertNull(back.trace[0].command)
+        assertNull(back.trace[0].output)
+    }
+
+    @Test
+    fun `没有输出副本的命令只落命令字段`() {
+        // RUNNING 的命令（还没结果）只有命令、没有输出：落盘不该出现空的 o 字段
+        val running = AgentStep.tool(
+            callId = "call_9",
+            name = "run_shell",
+            state = AgentStep.State.RUNNING,
+            argsRaw = """{"command":"sleep 30"}""",
+        )
+        val line = ChatHistoryStore.toLine(msg(9, "", trace = listOf(running)))
+        assertFalse("没有输出就不该落 o 字段", line.contains("\"o\""))
+        val back = ChatHistoryStore.parse(line).single()
+        assertEquals("sleep 30", back.trace[0].command)
+        assertNull(back.trace[0].output)
+    }
+
+    @Test
+    fun `旧历史没有产物字段时按空列表处理`() {
+        // 老版本落盘的 trace 行根本没有这个键 —— 回放必须不崩、不产出幽灵产物
+        val legacy = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[{"k":"tool:x","i":"TOOL","t":"apply_patch","d":"","s":"OK"}]}"""
+        val back = ChatHistoryStore.parse(legacy).single()
+        assertEquals(1, back.trace.size)
+        assertTrue(back.trace[0].artifacts.isEmpty())
+    }
+
+    @Test
+    fun `产物条目缺路径时被丢弃而不是给用户一个打不开的芯片`() {
+        // 宁可少显示一个，也不给一个打不开的路径 —— 后者会让用户以为文件丢了
+        val dirty = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[{"k":"tool:x","i":"TOOL","t":"apply_patch","d":"","s":"OK","r":[{"l":"a.txt"}]}]}"""
+        val back = ChatHistoryStore.parse(dirty).single()
+        assertTrue(back.trace[0].artifacts.isEmpty())
+    }
+
+    @Test
+    fun `不认识的动作降级为中性而不是丢掉整个产物`() {
+        val dirty = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[{"k":"tool:x","i":"TOOL","t":"t","d":"","s":"OK","r":[{"p":"/a/b.txt","l":"b.txt","a":"FUTURE_ACTION"}]}]}"""
+        val back = ChatHistoryStore.parse(dirty).single()
+        assertEquals(1, back.trace[0].artifacts.size)
+        assertEquals(AgentStep.Action.TOUCH, back.trace[0].artifacts[0].action)
+    }
+
+    @Test
+    fun `旧数据只有文件名的产物芯片回放时补上项目名`() {
+        // 本次改动前落盘的展示名只有文件名（`index.html`），多项目并行时分不清归属；
+        // 回放时从私有镜像绝对路径补出「项目名/项目内相对路径」。
+        val old = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[""" +
+            """{"k":"tool:x","i":"TOOL","t":"save_code_file","d":"","s":"OK","r":[""" +
+            """{"p":"/data/user/0/com.rokidlab.phone/files/aiui_projects/html-test/index.html","l":"index.html","a":"WRITE"}]}]}"""
+        val back = ChatHistoryStore.parse(old).single()
+        assertEquals("html-test/index.html", back.trace[0].artifacts[0].label)
+    }
+
+    @Test
+    fun `项目镜像之外的旧产物仍只保留文件名`() {
+        // 下载目录等非项目路径没有「项目名」概念，补全逻辑不能把整条绝对路径塞进芯片
+        val old = """{"id":1,"isUser":false,"content":"hi","time":"10:00","isStatus":false,"trace":[{"k":"tool:x","i":"TOOL","t":"t","d":"","s":"OK","r":[{"p":"/sdcard/Download/abc/report.html","l":"report.html","a":"CREATE"}]}]}"""
+        val back = ChatHistoryStore.parse(old).single()
+        assertEquals("report.html", back.trace[0].artifacts[0].label)
+    }
+
+    @Test
+    fun `落盘里残留的进行中步骤回放时收为终态`() {
+        // 依据：正常收尾一定写终态（ChatStateHolder.finishTrace / finalizeTraceReply），
+        // 所以磁盘上还有 RUNNING 只可能是那一轮没跑完就结束了（进程被杀 / 强退）。
+        val src = msg(1, "", trace = steps()) // steps()[0] 的 state 默认就是 RUNNING
+        assertEquals(AgentStep.State.RUNNING, src.trace[0].state)
+
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertTrue(
+            "回放后不应再有 RUNNING，否则「过程」卡片重启后会永远转圈",
+            back.trace.none { it.state == AgentStep.State.RUNNING },
+        )
+        assertEquals(AgentStep.State.OK, back.trace[0].state)
+        // 原本已是终态的步骤不受影响
+        assertEquals(AgentStep.State.OK, back.trace[1].state)
+        assertEquals(AgentStep.State.FAILED, back.trace[2].state)
+    }
+
+    @Test
+    fun `无过程的消息落盘不含 trace 字段且回放为空列表`() {
+        val src = msg(1, "普通闲聊")
+        assertFalse("空过程不应写入字段", ChatHistoryStore.toLine(src).contains("trace"))
+        assertTrue(ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single().trace.isEmpty())
+    }
+
+    @Test
+    fun `只有过程没有正文的消息也能落盘并回放`() {
+        // 工具执行阶段正文还没开始流式生成，此时消息 content 为空、只有 trace
+        val src = msg(5, "", trace = steps().take(1))
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals("", back.content)
+        assertEquals(1, back.trace.size)
+        assertEquals("think:0", back.trace[0].key)
+    }
+
+    @Test
+    fun `过程字段脏数据降级为安全默认而不丢整条消息`() {
+        val line = "{\"id\":1,\"content\":\"回复\",\"trace\":[" +
+            "{\"k\":\"tool:x\",\"i\":\"NOT_A_KIND\",\"t\":\"t\",\"d\":\"d\",\"s\":\"NOT_A_STATE\"}," +
+            "{\"t\":\"缺 key 应被跳过\"}," +
+            "\"裸字符串\"" +
+            "]}"
+        val back = ChatHistoryStore.parse(line).single()
+        assertEquals("回复", back.content)
+        assertEquals("脏枚举要降级而非丢弃整条", 1, back.trace.size)
+        assertEquals(AgentStep.Kind.TOOL, back.trace[0].kind)
+        assertEquals(AgentStep.State.OK, back.trace[0].state)
+    }
+
+    @Test
+    fun `旧历史无 trace 字段照样能解析（向后兼容）`() {
+        val line = "{\"id\":1,\"isUser\":false,\"content\":\"老消息\",\"time\":\"10:00\",\"isStatus\":false}"
+        val back = ChatHistoryStore.parse(line).single()
+        assertEquals("老消息", back.content)
+        assertTrue(back.trace.isEmpty())
+    }
+
+    // ── 文件级语义 ──
+
+    @Test
+    fun `appendLine 追加不破坏已有内容`() {
+        val file = newFile()
+        ChatHistoryStore.appendLine(file, ChatHistoryStore.toLine(msg(1, "a")))
+        ChatHistoryStore.appendLine(file, ChatHistoryStore.toLine(msg(2, "b")))
+        assertEquals(2, file.readText().trim().lines().size)
+        ChatHistoryStore.appendLine(file, ChatHistoryStore.toLine(msg(3, "c")))
+        assertEquals(listOf("a", "b", "c"), ChatHistoryStore.readHistory(file).map { it.content })
+    }
+
+    @Test
+    fun `rewrite 空列表删除文件（clear 后重启不复活历史）`() {
+        val file = newFile()
+        ChatHistoryStore.appendLine(file, ChatHistoryStore.toLine(msg(1, "a")))
+        assertTrue(file.exists())
+        ChatHistoryStore.rewrite(file, emptyList())
+        assertFalse("clear 必须删文件，否则重启后历史复活", file.exists())
+        assertTrue(ChatHistoryStore.readHistory(file).isEmpty())
+    }
+
+    @Test
+    fun `readHistory 文件不存在返回空列表`() {
+        assertTrue(ChatHistoryStore.readHistory(File(tmp.root, "nope.json")).isEmpty())
+    }
+
+    @Test
+    fun `appendLine 自动创建父目录`() {
+        val nested = File(tmp.newFolder(), "sub/dir/history.json")
+        ChatHistoryStore.appendLine(nested, ChatHistoryStore.toLine(msg(1, "a")))
+        assertEquals(listOf("a"), ChatHistoryStore.readHistory(nested).map { it.content })
+    }
+
+    // ── 本轮 token 成本（「过程」区块右下角）──
+
+    @Test
+    fun `用量往返保留四个字段`() {
+        val src = msg(3, "答").copy(
+            usage = MsgUsage(inputTokens = 19518, outputTokens = 73, modelCalls = 2, elapsedMs = 1968L),
+        )
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals(19518, back.usage?.inputTokens)
+        assertEquals(73, back.usage?.outputTokens)
+        assertEquals(2, back.usage?.modelCalls)
+        assertEquals(1968L, back.usage?.elapsedMs)
+    }
+
+    @Test
+    fun `缓存命中字段往返保留`() {
+        // 2026-09-26 P0：前缀缓存命中量随用量一起落盘（"h" 键）；旧文件没有该键读回 null
+        val src = msg(7, "答").copy(
+            usage = MsgUsage(inputTokens = 1000, outputTokens = 50, promptCacheHitTokens = 800, modelCalls = 1, elapsedMs = null),
+        )
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertEquals(800, back.usage?.promptCacheHitTokens)
+        // 旧历史（无 "h" 键）读回 null，不是 0
+        val old = msg(8, "答").copy(
+            usage = MsgUsage(inputTokens = 10, outputTokens = 1, promptCacheHitTokens = null, modelCalls = 1, elapsedMs = null),
+        )
+        assertNull(ChatHistoryStore.parse(ChatHistoryStore.toLine(old)).single().usage?.promptCacheHitTokens)
+    }
+
+    @Test
+    fun `拿不到的用量读回 null 而不是 0`() {
+        // 服务端不返回 usage 时 token 数是 null = "不知道"。落盘再读回来必须还是 null：
+        // 面板上写「输入 0 / 输出 0」是**错误信息**，比不显示更糟（用户会拿它当账单）。
+        val src = msg(4, "答").copy(
+            usage = MsgUsage(inputTokens = null, outputTokens = null, modelCalls = 3, elapsedMs = null),
+        )
+        val back = ChatHistoryStore.parse(ChatHistoryStore.toLine(src)).single()
+        assertNull(back.usage?.inputTokens)
+        assertNull(back.usage?.outputTokens)
+        assertEquals(3, back.usage?.modelCalls)
+        assertNull(back.usage?.elapsedMs)
+    }
+
+    @Test
+    fun `没有用量时不落字段且回放为 null`() {
+        val plain = msg(5, "纯文本")
+        assertFalse("无用量不该写字段", ChatHistoryStore.toLine(plain).contains("usage"))
+        assertNull(ChatHistoryStore.parse(ChatHistoryStore.toLine(plain)).single().usage)
+    }
+
+    @Test
+    fun `四个字段全空时整组不落盘`() {
+        val empty = msg(6, "答").copy(
+            usage = MsgUsage(inputTokens = null, outputTokens = null, promptCacheHitTokens = null, modelCalls = null, elapsedMs = null),
+        )
+        assertFalse("全空不该留下一个空对象", ChatHistoryStore.toLine(empty).contains("usage"))
+        assertNull(ChatHistoryStore.parse(ChatHistoryStore.toLine(empty)).single().usage)
+    }
+}
