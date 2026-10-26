@@ -1,0 +1,37 @@
+# ── gradle.properties 模板 ──
+# 复制为 gradle.properties 后按实际值填写（该文件已被 .gitignore 排除，不会入库）。
+#
+# ⚠️ 口令类项也可以放在 ~/.gradle/gradle.properties（推荐）或环境变量
+#    ORG_GRADLE_PROJECT_<属性名> 中，无需写进本工程目录。
+
+# ── Android / Gradle 基础项 ──
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+# ⚠️ 不要设 android.suppressUnsupportedCompileSdk —— 本工程 compileSdk=34、AGP 8.5.0 本就最高支持 34，
+#    该属性只在用更新 compileSdk 时才有意义，设了等于把真实告警压掉。
+#    真要升 compileSdk 时，正确做法是升 AGP，而不是加这个属性。
+org.gradle.jvmargs=-Xmx2560m -Dfile.encoding=UTF-8
+# ⚠️ 这行别漏。release（R8 + 全量 Kotlin）默认沿用上面的 jvmargs 上限，
+#    实测会报 "Not enough memory to run compilation"。CI 跑 assembleRelease 时
+#    runner 只有 7GB 内存、2 核，比开发机更紧，漏了这行会**间歇性**构建失败。
+kotlin.daemon.jvmargs=-Xmx3072m
+# 双模块并行 + 构建缓存：R8 是最慢的一步且不可增量，收益最明显。
+# 内存紧张的 runner（如 7GB）若发现构建变慢或 OOM，可先注释掉 parallel 定位。
+org.gradle.parallel=true
+org.gradle.caching=true
+
+# ── release 签名（四项全部必需，缺失时构建会直接失败）──
+# keystore 文件路径，可省略（默认 D:\rokidapp\release.keystore）
+RELEASE_KEYSTORE_PATH=D:\\rokidapp\\release.keystore
+# keystore 口令
+RELEASE_KEYSTORE_PASSWORD=
+# 签名密钥别名（本机实测为 rokidbrew）
+RELEASE_KEY_ALIAS=
+# 签名密钥口令
+RELEASE_KEY_PASSWORD=
+
+# ── 第三方服务令牌：已**不再走构建期注入** ──
+# 2026-10-18 属主确认 Gitee / 爱发电 / 酷我三令牌**官方允许明码**，已回退为源码明文
+# 常量（AppConfig.kt / DeveloperScreen.kt / SettingsScreen.kt），并登记进
+# `checkNoHardcodedSecrets` 的 `allowedPlaintextTokens` 豁免名单。
+# 本文件只保留签名四项；未来引入真凭据（keystore 口令之外的）再用 buildConfigField 注入。
